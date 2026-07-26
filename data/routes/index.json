@@ -1,0 +1,98 @@
+[
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-campos-do-jordao-sao-paulo-regiao-sudeste-brasil",
+    "name": "Sorocaba → Campos do Jordão",
+    "distanceKm": 274.8,
+    "elevationGainM": 4291,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-campos-do-jordao-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 1"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-campos-do-jordao-sao-paulo-regiao-sudeste-brasil-alt2",
+    "name": "Sorocaba → Campos do Jordão",
+    "distanceKm": 265.2,
+    "elevationGainM": 3950,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-campos-do-jordao-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 2"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-campos-do-jordao-sao-paulo-regiao-sudeste-brasil-alt3",
+    "name": "Sorocaba → Campos do Jordão",
+    "distanceKm": 323.6,
+    "elevationGainM": 5662,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-campos-do-jordao-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 3"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-ubatuba-sao-paulo-regiao-sudeste-brasil",
+    "name": "Sorocaba → Ubatuba",
+    "distanceKm": 321.2,
+    "elevationGainM": 4607,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-ubatuba-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 1"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-ubatuba-sao-paulo-regiao-sudeste-brasil-alt2",
+    "name": "Sorocaba → Ubatuba",
+    "distanceKm": 370,
+    "elevationGainM": 5984,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-ubatuba-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 2"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-ubatuba-sao-paulo-regiao-sudeste-brasil-alt3",
+    "name": "Sorocaba → Ubatuba",
+    "distanceKm": 393.6,
+    "elevationGainM": 7472,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-ubatuba-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 3"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-tapirai-sao-paulo-regiao-sudeste-18180-000-brasil",
+    "name": "Sorocaba → Tapiraí",
+    "distanceKm": 64.5,
+    "elevationGainM": 1218,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-tapirai-sao-paulo-regiao-sudeste-18180-000-brasil",
+    "variantLabel": "Route 1"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-itanhaem-sao-paulo-regiao-sudeste-brasil",
+    "name": "Sorocaba → Itanhaém",
+    "distanceKm": 214.6,
+    "elevationGainM": 3859,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-itanhaem-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 1"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-itanhaem-sao-paulo-regiao-sudeste-brasil-alt2",
+    "name": "Sorocaba → Itanhaém",
+    "distanceKm": 200.3,
+    "elevationGainM": 2938,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-itanhaem-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 2"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-itanhaem-sao-paulo-regiao-sudeste-brasil-alt3",
+    "name": "Sorocaba → Itanhaém",
+    "distanceKm": 223.5,
+    "elevationGainM": 2881,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-itanhaem-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 3"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-sao-pedro-sao-paulo-regiao-sudeste-brasil",
+    "name": "Sorocaba → São Pedro",
+    "distanceKm": 143.8,
+    "elevationGainM": 1890,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-sao-pedro-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 1"
+  },
+  {
+    "slug": "sorocaba-sao-paulo-regiao-sudeste-brasil-sao-pedro-sao-paulo-regiao-sudeste-brasil-alt2",
+    "name": "Sorocaba → São Pedro",
+    "distanceKm": 180,
+    "elevationGainM": 2537,
+    "courseId": "sorocaba-sao-paulo-regiao-sudeste-brasil-sao-pedro-sao-paulo-regiao-sudeste-brasil",
+    "variantLabel": "Route 2"
+  }
+]

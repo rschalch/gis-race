@@ -1,0 +1,915 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  font-family: system-ui, sans-serif;
+}
+
+#map {
+  position: absolute;
+  inset: 0 0 120px 0;
+}
+
+#profile {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 120px;
+  width: 100%;
+  z-index: 1;
+  background: rgba(15, 23, 42, 0.85);
+  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.3);
+}
+
+/*
+ * user-select: none is load-bearing, not cosmetic. Buttons get this for
+ * free from the browser's UA stylesheet, but plain elements like table
+ * cells don't — holding a mousedown on selectable text (even without any
+ * real pointer movement; synthetic and real input both carry enough jitter
+ * to trigger it) makes the browser start a text-selection drag gesture,
+ * which then suppresses the click event that would otherwise fire on
+ * mouseup. Confirmed by reproduction: an instant click on a leaderboard row
+ * worked, but the same click held for 150ms did not, even with the
+ * simulation paused (so it wasn't DOM churn).
+ */
+#hud {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 1;
+  width: 700px;
+  background: rgba(15, 23, 42, 0.85);
+  color: #f1f5f9;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* F2: rows scale poorly past ~30 cars — scroll the body instead of pushing
+ * the finish board/incident feed off-screen or growing the HUD unbounded. */
+.leaderboard-scroll {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* table-layout: fixed keeps every interactive row's width stable frame to
+ * frame regardless of digit-count changes in the numeric cells — good
+ * general practice even though the actual click-swallowing bug turned out
+ * to be the unconditional appendChild reorder in hud.ts, not layout shift. */
+.leaderboard {
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+
+.leaderboard th:nth-child(1),
+.leaderboard td:nth-child(1) {
+  width: 30px;
+}
+.leaderboard th:nth-child(2),
+.leaderboard td:nth-child(2) {
+  width: 145px;
+}
+.leaderboard th:nth-child(3),
+.leaderboard td:nth-child(3) {
+  width: 65px;
+}
+.leaderboard th:nth-child(4),
+.leaderboard td:nth-child(4) {
+  width: 65px;
+}
+.leaderboard th:nth-child(5),
+.leaderboard td:nth-child(5) {
+  width: 78px;
+}
+.leaderboard th:nth-child(6),
+.leaderboard td:nth-child(6) {
+  width: 78px;
+}
+.leaderboard th:nth-child(7),
+.leaderboard td:nth-child(7) {
+  width: 65px;
+}
+.leaderboard th:nth-child(8),
+.leaderboard td:nth-child(8) {
+  width: 120px;
+}
+
+.leaderboard th,
+.leaderboard td {
+  padding: 2px 8px 2px 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.leaderboard th {
+  font-weight: 600;
+  color: #94a3b8;
+  border-bottom: 1px solid #334155;
+}
+
+.leaderboard tbody tr {
+  cursor: pointer;
+}
+
+.leaderboard tbody tr:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.leaderboard tbody tr.selected {
+  background: rgba(59, 130, 246, 0.25);
+  /* outline on a <tr> isn't reliably contained by the table's own box in
+   * every browser — it could render past the panel's rounded edge. An inset
+   * box-shadow is drawn strictly inside the row's own border box, so it
+   * can never visually overflow the pane. */
+  box-shadow: inset 0 0 0 1px #3b82f6;
+}
+
+.car-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+
+.camera-controls {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.camera-controls button {
+  font: inherit;
+  font-size: 12px;
+  background: #1e293b;
+  color: #cbd5e1;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.camera-controls button:hover {
+  background: #334155;
+}
+
+.camera-controls button.active {
+  background: #3b82f6;
+  border-color: #3b82f6;
+  color: #ffffff;
+}
+
+#race-controls {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  /* #hud is 700px wide starting at the left edge, so on typical viewport
+   * widths this centered bar's bounding box overlaps it — and since #hud
+   * comes later in index.html's DOM order, it paints on top at equal
+   * z-index, silently swallowing clicks on the time-scale/pause/reset
+   * buttons underneath. Higher z-index keeps this bar clickable and fully
+   * visible above the HUD panel wherever they overlap. */
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(15, 23, 42, 0.85);
+  color: #f1f5f9;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#race-controls button {
+  font: inherit;
+  font-size: 12px;
+  background: #1e293b;
+  color: #cbd5e1;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+#race-controls button:hover {
+  background: #334155;
+}
+
+#race-controls button.active {
+  background: #3b82f6;
+  border-color: #3b82f6;
+  color: #ffffff;
+}
+
+.elapsed-time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  min-width: 60px;
+}
+
+.time-scale-buttons {
+  display: flex;
+  gap: 4px;
+}
+
+.finish-board {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #334155;
+}
+
+.finish-board h4 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+/* Rank is rendered as a cell (not the ol's list marker) so the time and
+ * average-speed columns line up regardless of car-name length. */
+.finish-board ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+
+.finish-board li {
+  display: grid;
+  grid-template-columns: 22px 16px minmax(0, 1fr) 80px 110px;
+  gap: 4px;
+  align-items: center;
+  margin-bottom: 2px;
+}
+
+.finish-rank {
+  color: #94a3b8;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.finish-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.finish-time {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.finish-avg {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.incident-feed {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #334155;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.incident-feed h4 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+.incident-feed ol {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: #cbd5e1;
+}
+
+.incident-feed li {
+  margin-bottom: 2px;
+}
+
+#panel-triggers {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 1;
+  display: flex;
+  gap: 8px;
+}
+
+#panel-triggers button {
+  font: inherit;
+  font-size: 13px;
+  background: rgba(15, 23, 42, 0.85);
+  color: #f1f5f9;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  padding: 8px 14px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+}
+
+#panel-triggers button:hover {
+  background: #1e293b;
+}
+
+#config-panel,
+#routes-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+}
+
+.config-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.6);
+}
+
+/* The modal owns no scrollbar itself — header and footer stay pinned while
+ * only .config-body scrolls, so Apply & Restart is always reachable however
+ * long the car list grows. */
+.config-modal {
+  position: relative;
+  width: min(920px, 94vw);
+  margin: 6vh auto;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  background: #0f172a;
+  color: #f1f5f9;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+/* Signature: a quiet checkered ribbon along the top edge — the one
+ * racing-specific flourish; everything below it stays plain. */
+.config-modal::before {
+  content: '';
+  flex: none;
+  height: 8px;
+  /* 8px tiles at 8px height show a full 2×2 check — at half the tile
+   * height this degrades into a dashed line instead of a checkerboard. */
+  background: repeating-conic-gradient(#475569 0% 25%, #1e293b 0% 50%);
+  background-size: 8px 8px;
+  opacity: 0.75;
+}
+
+@keyframes config-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .config-modal {
+    animation: config-enter 0.16s ease-out;
+  }
+}
+
+.config-modal :is(button, select, input):focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 1px;
+}
+
+.config-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 24px;
+  border-bottom: 1px solid #1e293b;
+}
+
+.config-header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.config-close {
+  font: inherit;
+  font-size: 22px;
+  line-height: 1;
+  background: none;
+  border: none;
+  color: #94a3b8;
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.config-close:hover {
+  color: #f1f5f9;
+  background: #1e293b;
+}
+
+.config-body {
+  overflow-y: auto;
+  padding: 18px 24px 8px;
+}
+
+/* Two panels now: Routes (courses + bake form) and Configure Race (cars +
+ * rules). Both are single-column, so each gets its own natural width. */
+.routes-modal {
+  width: min(560px, 94vw);
+}
+
+.cars-modal {
+  width: min(680px, 94vw);
+}
+
+@media (max-width: 760px) {
+  .config-modal {
+    width: 96vw;
+    margin: 3vh auto;
+    max-height: 93vh;
+  }
+}
+
+.config-section {
+  margin-bottom: 20px;
+}
+
+.config-section h4 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+.config-hint {
+  font-weight: 400;
+  color: #64748b;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+/* One row per course in the Routes panel: name + per-variant metrics on the
+ * left, delete on the right. */
+.routes-course-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  overflow-y: auto;
+  max-height: 40vh;
+}
+
+.routes-course-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #1e293b;
+}
+
+.routes-course-list li:last-child {
+  border-bottom: none;
+}
+
+.routes-course-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.routes-course-name {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.routes-course-meta {
+  color: #64748b;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.routes-course-rename {
+  font: inherit;
+  font-size: 13px;
+  flex: none;
+  background: #1e293b;
+  color: #cbd5e1;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+
+.routes-course-rename:hover {
+  background: #334155;
+  color: #f1f5f9;
+}
+
+.routes-course-rename-input {
+  font: inherit;
+  font-size: 13px;
+  width: 100%;
+  background: #0f172a;
+  color: #f1f5f9;
+  border: 1px solid #60a5fa;
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
+.routes-course-delete {
+  font: inherit;
+  font-size: 12px;
+  flex: none;
+  background: #1e293b;
+  color: #fca5a5;
+  border: 1px solid #7f1d1d;
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.routes-course-delete:hover:not(:disabled) {
+  background: #7f1d1d;
+  color: #fee2e2;
+}
+
+.routes-course-delete:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.routes-delete-status {
+  font-size: 12px;
+  color: #94a3b8;
+  margin: 8px 0 0;
+}
+
+/* Dashed border = the empty-slot idiom: this card adds something that
+ * doesn't exist yet, unlike the solid sections around it. */
+.config-new-course {
+  border: 1px dashed #334155;
+  border-radius: 10px;
+  padding: 12px 14px 14px;
+  background: rgba(30, 41, 59, 0.35);
+}
+
+.config-new-course-intro {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+/* Checkbox first, then ONE text span (config-checkbox-text) — raw text
+ * nodes as flex items wrap onto their own line and orphan the checkbox. */
+.config-checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.config-checkbox input {
+  margin: 1px 0 0;
+  flex: none;
+}
+
+.config-checkbox-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.config-new-course .config-checkbox {
+  margin-top: 10px;
+}
+
+.config-select-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 13px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.config-select-row select {
+  font: inherit;
+  font-size: 13px;
+  background: #1e293b;
+  color: #f1f5f9;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+
+.autocomplete-field {
+  position: relative;
+  margin-top: 8px;
+}
+
+.autocomplete-field label {
+  display: block;
+  font-size: 12px;
+  color: #94a3b8;
+  margin-bottom: 3px;
+}
+
+.autocomplete-field input {
+  font: inherit;
+  font-size: 13px;
+  width: 100%;
+  background: #1e293b;
+  color: #f1f5f9;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.autocomplete-field input:disabled {
+  opacity: 0.6;
+}
+
+.autocomplete-suggestions {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  z-index: 1;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  max-height: 160px;
+  overflow-y: auto;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.autocomplete-suggestions li {
+  padding: 6px 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.autocomplete-suggestions li:hover {
+  background: #334155;
+}
+
+.config-bake-button {
+  font: inherit;
+  font-size: 13px;
+  width: 100%;
+  margin-top: 10px;
+  background: #1e293b;
+  color: #f1f5f9;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+
+.config-bake-button:hover:not(:disabled) {
+  background: #334155;
+}
+
+.config-bake-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.config-bake-status {
+  font-size: 12px;
+  color: #94a3b8;
+  margin: 8px 0 0;
+}
+
+.config-bake-status-error {
+  color: #f87171;
+}
+
+.config-cars-toolbar {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.config-car-search {
+  flex: 1;
+  font: inherit;
+  font-size: 13px;
+  background: #0f172a;
+  color: #f1f5f9;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+
+.config-cars-toolbar button {
+  font: inherit;
+  font-size: 12px;
+  background: #1e293b;
+  color: #cbd5e1;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.config-cars-toolbar button:hover {
+  background: #334155;
+}
+
+.config-cars {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* F2: roster is data now and can grow well past a glance-able list —
+   * scroll instead of pushing the rest of the modal off-screen. */
+  max-height: 52vh;
+}
+
+/* Header + rows share one grid template so the sortable stat columns line
+ * up: [car | hp | top speed | weight | route]. The select sits OUTSIDE the
+ * label on purpose — inside it, picking a route would also toggle the car's
+ * checkbox. */
+.config-cars-header,
+.config-cars li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 52px 78px 66px 150px;
+  gap: 8px;
+  align-items: center;
+  padding-right: 10px;
+}
+
+.config-cars-header {
+  padding: 4px 10px 4px;
+  border: 1px solid #334155;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  background: #1e293b;
+}
+
+.config-cars-header button,
+.config-cars-header span {
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #94a3b8;
+  background: none;
+  border: none;
+  padding: 2px 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.config-cars-header button {
+  cursor: pointer;
+}
+
+.config-cars-header button:hover {
+  color: #f1f5f9;
+}
+
+.config-cars-header button.config-sort-active {
+  color: #93c5fd;
+}
+
+.config-cars-header button:not([data-sort='name']),
+.config-car-num {
+  text-align: right;
+}
+
+.config-cars {
+  border-radius: 0 0 6px 6px;
+}
+
+.config-cars li {
+  border-bottom: 1px solid #1e293b;
+}
+
+.config-cars li:last-child {
+  border-bottom: none;
+}
+
+.config-car-label {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0 7px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.config-cars li:hover {
+  background: #1e293b;
+}
+
+.config-car-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.config-car-num {
+  font-size: 12px;
+  color: #cbd5e1;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Per-car route pick — every route in the index is available to every car. */
+.config-car-route {
+  font: inherit;
+  font-size: 12px;
+  width: 100%;
+  min-width: 0;
+  background: #0f172a;
+  color: #93c5fd;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 3px 6px;
+}
+
+.config-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 24px;
+  border-top: 1px solid #1e293b;
+}
+
+.config-error {
+  flex: 1;
+  color: #f87171;
+  font-size: 13px;
+  margin: 0;
+}
+
+/* Keeps Cancel/Apply pinned right whether or not the error line is shown. */
+.config-actions [data-config-action='cancel'] {
+  margin-left: auto;
+}
+
+.config-actions button {
+  font: inherit;
+  font-size: 13px;
+  background: #1e293b;
+  color: #f1f5f9;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+.config-actions button:hover {
+  background: #334155;
+}
+
+.config-actions [data-config-action='apply'] {
+  background: #3b82f6;
+  border-color: #3b82f6;
+}
+
+.config-actions [data-config-action='apply']:hover {
+  background: #2563eb;
+}

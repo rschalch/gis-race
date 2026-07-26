@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GIS Racing Simulator</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏁</text></svg>" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="map"></div>
+    <div id="panel-triggers">
+      <button id="routes-trigger">🛣 Routes</button>
+      <button id="config-trigger">⚙ Configure Race</button>
+    </div>
+    <div id="routes-panel" hidden></div>
+    <div id="config-panel" hidden></div>
+    <div id="race-controls"></div>
+    <div id="hud"></div>
+    <canvas id="profile"></canvas>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
