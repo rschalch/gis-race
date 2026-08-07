@@ -1,21 +1,54 @@
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { loadRoute, loadRouteIndex, interpolateAt } from './route';
-import { initMap, updateCarPositions, setRouteData, fitToRoutes, followCar, onCarClick, onUserPan } from './render/map';
+import { loadRoute, loadRouteIndex, interpolateAt, headingAt, CAR_HEADING_WINDOW_M } from './route';
+import {
+  initMap,
+  updateCarPositions,
+  setRouteData,
+  fitToRoutes,
+  followCar,
+  resetChaseCam,
+  onCarClick,
+  onUserPan,
+} from './render/map';
 import { initHud, type CameraState } from './render/hud';
-import { initRaceControls } from './render/race-controls';
+import { initRaceControls, TIME_SCALES } from './render/race-controls';
+import { initKeyboard } from './render/keyboard';
 import { initProfile } from './render/profile';
 import { initConfigPanel, type ConfigApplyResult } from './render/config-panel';
 import { initRoutesPanel } from './render/routes-panel';
+import { initSummary } from './render/summary';
 import { createRouteStore } from './render/route-store';
-import { createSim, tick, resolveLeader, type CarAssignment, type Sim } from './sim';
+import { createSim, tick, resolveLeader, raceRank, type CarAssignment, type Sim } from './sim';
 import type { CarState, Incident, Route, Weather } from './types';
 import { loadCars } from './cars';
+import { MAX_FIELD_SIZE, buildFairField, tierOf } from './roster';
+import { START_INTERVAL_S } from './tuning';
 
 const HUD_INTERVAL_S = 0.1; // ~10 Hz (P2) — HUD text writes, not map markers
 
-function resolveCameraTargetCar(cars: CarState[], target: string | 'leader' | null): CarState | null {
+/**
+ * How often the elevation strip is redrawn, in simulated-independent real
+ * seconds (~20 Hz).
+ *
+ * Redrawing it is not free: it blits a full-width backing canvas (a 2800×240
+ * bitmap on a Retina display), strokes the speed trace, and draws a marker per
+ * incident and a dot per car. It was doing that every animation frame, on the
+ * same main thread MapLibre uses to handle a drag gesture.
+ *
+ * 20 Hz is invisible here in a way it would not be on the map: the strip maps a
+ * whole 225 km route onto ~1400 px, so a car at 30 m/s advances 0.2 pixels per
+ * *second*. Even the fastest car on the shortest route cannot move a pixel
+ * between redraws.
+ */
+const PROFILE_INTERVAL_S = 0.05;
+
+function resolveCameraTargetCar(
+  cars: CarState[],
+  target: string | 'leader' | null,
+  simTime: number,
+): CarState | null {
   if (target === null) return null;
-  if (target === 'leader') return resolveLeader(cars);
+  if (target === 'leader') return resolveLeader(cars, simTime);
   return cars.find((c) => c.spec.id === target) ?? null;
 }
 
@@ -40,10 +73,14 @@ function createStandbySim(
   assignments: CarAssignment[],
   globalCapEnabled: boolean,
   weather: Weather,
+  startIntervalS: number,
   timeScale: number,
   onIncident: Sim['onIncident'],
+  // Explicit seed replays a specific race (the summary's "Replay this seed");
+  // omitted means a fresh random one, which is what every new race wants.
+  seed: number = randomSeed(),
 ): Sim {
-  const sim = createSim(assignments, randomSeed(), globalCapEnabled, weather);
+  const sim = createSim(assignments, seed, globalCapEnabled, weather, startIntervalS);
   sim.paused = true;
   sim.timeScale = timeScale;
   sim.onIncident = onIncident;
@@ -63,6 +100,8 @@ interface AppState {
   routesBySlug: Map<string, Route>;
   globalCapEnabled: boolean;
   weather: Weather;
+  /** Seconds between cars leaving the line; 0 is a mass start. */
+  startIntervalS: number;
   sim: Sim;
   camera: CameraState;
 }
@@ -79,6 +118,7 @@ async function bootstrap() {
   const routesTriggerOrNull = document.getElementById('routes-trigger');
   const routesPanelOrNull = document.getElementById('routes-panel');
   const profileCanvasOrNull = document.getElementById('profile');
+  const summaryContainerOrNull = document.getElementById('summary');
   if (!mapContainer) throw new Error('#map container not found');
   if (!hudContainerOrNull) throw new Error('#hud container not found');
   if (!raceControlsContainerOrNull) throw new Error('#race-controls container not found');
@@ -87,6 +127,8 @@ async function bootstrap() {
   if (!routesTriggerOrNull) throw new Error('#routes-trigger not found');
   if (!routesPanelOrNull) throw new Error('#routes-panel not found');
   if (!(profileCanvasOrNull instanceof HTMLCanvasElement)) throw new Error('#profile canvas not found');
+  if (!summaryContainerOrNull) throw new Error('#summary container not found');
+  const summaryContainer: HTMLElement = summaryContainerOrNull;
   const hudContainer: HTMLElement = hudContainerOrNull;
   const raceControlsContainer: HTMLElement = raceControlsContainerOrNull;
   const profileCanvas: HTMLCanvasElement = profileCanvasOrNull;
@@ -94,16 +136,25 @@ async function bootstrap() {
   const routeStore = createRouteStore(routeIndex);
   const initialRouteSlug = routeIndex[0]!.slug;
   const initialRoute = await loadRoute(initialRouteSlug);
-  const initialCarIds = new Set(CARS.map((c) => c.id)); // default: everyone races
+  // Default grid: the roster spans ~200 cars from a Fiat Uno to a Bugatti
+  // Bolide, so "everyone races" would be neither readable nor a contest.
+  // Start with a competitive Sport-class field instead — the config panel's
+  // class filter and grid actions are how you get anything else.
+  const defaultTier = CARS.filter((c) => tierOf(c).id === 'sport');
+  const initialCarIds = new Set(
+    buildFairField(defaultTier.length >= MAX_FIELD_SIZE ? defaultTier : CARS, MAX_FIELD_SIZE).map((c) => c.id),
+  );
   const initialRoutesBySlug = new Map([[initialRouteSlug, initialRoute]]);
 
   initMap(mapContainer, initialRoutesBySlug, (map) => {
     const hud = initHud(hudContainer, {
       onSelectCar: (carId) => {
         state.camera = { mode: 'follow', target: carId };
+        resetChaseCam(map);
       },
       onFollowLeader: () => {
         state.camera = { mode: 'follow', target: 'leader' };
+        resetChaseCam(map);
       },
       onOverview: () => {
         state.camera = { mode: 'overview', target: null };
@@ -121,7 +172,13 @@ async function bootstrap() {
       onTogglePause: () => {
         state.sim.paused = !state.sim.paused;
       },
-      onReset: () => {
+      onReset: () => resetRace(),
+    });
+
+    // Hoisted so both the Reset button and the keyboard shortcut go through
+    // exactly one implementation.
+    function resetRace(): void {
+      {
         // Reset never changes routes or assignments, so it can rebuild
         // synchronously from what's already loaded — no network round-trip.
         state = rebuildRace({
@@ -129,13 +186,30 @@ async function bootstrap() {
           routesBySlug: state.routesBySlug,
           globalCapEnabled: state.globalCapEnabled,
           weather: state.weather,
+          startIntervalS: state.startIntervalS,
           timeScale: state.sim.timeScale,
         });
         fitToRoutes(map, [...state.routesBySlug.values()]);
-      },
-    });
+      }
+    }
 
     const profile = initProfile(profileCanvas);
+
+    const summary = initSummary(summaryContainer, {
+      onReplaySeed: (seed) => {
+        state = rebuildRace({
+          carAssignments: state.carAssignments,
+          routesBySlug: state.routesBySlug,
+          globalCapEnabled: state.globalCapEnabled,
+          weather: state.weather,
+          startIntervalS: state.startIntervalS,
+          timeScale: state.sim.timeScale,
+          seed,
+        });
+        fitToRoutes(map, [...state.routesBySlug.values()]);
+      },
+      onClose: () => {},
+    });
 
     function handleIncident(car: CarState, incident: Incident): void {
       hud.pushIncident(car, incident);
@@ -147,24 +221,46 @@ async function bootstrap() {
       }
     }
 
+    // Bumped by rebuildRace so the frame loop's render key changes even when
+    // the new race starts at the same simTime the old one was sitting at.
+    // Declared above rebuildRace, not beside the other loop state below it:
+    // rebuildRace runs once during setup, before that point in the function
+    // body, and a `let` read from inside it would hit the temporal dead zone.
+    let simGeneration = 0;
+
     function rebuildRace(overrides: {
       carAssignments: Array<{ carId: string; routeSlug: string }>;
       routesBySlug: Map<string, Route>;
       globalCapEnabled: boolean;
       weather: Weather;
+      startIntervalS: number;
       timeScale: number;
+      seed?: number;
     }): AppState {
       const assignments: CarAssignment[] = overrides.carAssignments.map(({ carId, routeSlug }) => {
         const spec = CARS.find((c) => c.id === carId)!;
         const route = overrides.routesBySlug.get(routeSlug)!;
         return { spec, route };
       });
+      // A new race must clear the summary, or the "already shown for this
+      // race" latch would suppress it for every subsequent race.
+      summary.reset();
+      simGeneration += 1;
       return {
         carAssignments: overrides.carAssignments,
         routesBySlug: overrides.routesBySlug,
         globalCapEnabled: overrides.globalCapEnabled,
         weather: overrides.weather,
-        sim: createStandbySim(assignments, overrides.globalCapEnabled, overrides.weather, overrides.timeScale, handleIncident),
+        startIntervalS: overrides.startIntervalS,
+        sim: createStandbySim(
+          assignments,
+          overrides.globalCapEnabled,
+          overrides.weather,
+          overrides.startIntervalS,
+          overrides.timeScale,
+          handleIncident,
+          overrides.seed,
+        ),
         camera: { mode: 'overview', target: null },
       };
     }
@@ -177,13 +273,57 @@ async function bootstrap() {
       routesBySlug: initialRoutesBySlug,
       globalCapEnabled: true, // §7.1's default — matches the spec's own stand-in for legal limits
       weather: 'dry', // R7's default — matches the spec's own baseline condition
+      startIntervalS: START_INTERVAL_S,
       timeScale: 1,
     });
     let lastTime: number | null = null;
     let hudAccumulator = HUD_INTERVAL_S; // render immediately on the first frame, then throttle
+    let profileAccumulator = PROFILE_INTERVAL_S;
     let applyGeneration = 0;
 
     initRoutesPanel(routesTriggerOrNull, routesPanelOrNull, routeStore);
+
+    initKeyboard({
+      onTogglePause: () => {
+        // Matches the button exactly, including its no-op on a finished race.
+        if (!state.sim.raceOver) state.sim.paused = !state.sim.paused;
+      },
+      onStepTimeScale: (direction) => {
+        const i = TIME_SCALES.indexOf(state.sim.timeScale);
+        // An unrecognised current scale (only reachable via the dev console)
+        // falls back to the slowest rather than throwing off the indexing.
+        const next = i === -1 ? 0 : Math.min(TIME_SCALES.length - 1, Math.max(0, i + direction));
+        state.sim.timeScale = TIME_SCALES[next]!;
+      },
+      onReset: () => resetRace(),
+      onOverview: () => {
+        state.camera = { mode: 'overview', target: null };
+        fitToRoutes(map, [...state.routesBySlug.values()]);
+      },
+      onFollowLeader: () => {
+        state.camera = { mode: 'follow', target: 'leader' };
+        resetChaseCam(map);
+      },
+      onFree: () => {
+        state.camera = { mode: 'free', target: state.camera.target };
+      },
+      onCycleCar: (direction) => {
+        // Steps through the field in current race order, so left/right means
+        // "the car ahead of / behind this one" rather than roster order.
+        const ranked = raceRank(state.sim.cars, state.sim.simTime);
+        if (ranked.length === 0) return;
+        const current = resolveCameraTargetCar(
+          state.sim.cars,
+          state.camera.mode === 'follow' ? state.camera.target : null,
+          state.sim.simTime,
+        );
+        const currentIndex = current ? ranked.findIndex((c) => c === current) : -1;
+        // Wraps, so holding one direction cycles the whole field.
+        const nextIndex = (currentIndex + direction + ranked.length) % ranked.length;
+        state.camera = { mode: 'follow', target: ranked[nextIndex]!.spec.id };
+        resetChaseCam(map);
+      },
+    });
 
     const configPanel = initConfigPanel(
       configTriggerOrNull,
@@ -194,6 +334,7 @@ async function bootstrap() {
       initialCarIds,
       state.globalCapEnabled,
       state.weather,
+      state.startIntervalS,
       {
         onApply: (result) => {
           applyConfig(result).catch((err: unknown) => {
@@ -220,6 +361,7 @@ async function bootstrap() {
         routesBySlug,
         globalCapEnabled: result.globalCapEnabled,
         weather: result.weather,
+        startIntervalS: result.startIntervalS,
         timeScale: state.sim.timeScale,
       });
       setRouteData(map, state.routesBySlug);
@@ -228,6 +370,7 @@ async function bootstrap() {
 
     onCarClick(map, (carId) => {
       state.camera = { mode: 'follow', target: carId };
+      resetChaseCam(map);
     });
 
     // F3: dragging the map while following should break out of follow mode
@@ -239,13 +382,49 @@ async function bootstrap() {
       }
     });
 
+    // Everything the per-frame render output depends on, as one cheap value.
+    // A paused race (config panel open, post-race summary, the standby state
+    // before Start) otherwise still re-uploaded the car source, rebuilt the
+    // deck.gl layer and redrew the elevation strip sixty times a second to
+    // produce a pixel-identical frame — which also kept MapLibre repainting
+    // continuously instead of going idle. The key is derived, not a dirty flag
+    // set by hand at each of the eight places the camera can change: a flag
+    // someone forgets to set is a stale screen.
+    let lastRenderKey = '';
+    function renderKey(): string {
+      return [
+        state.sim.simTime,
+        state.sim.cars.length,
+        state.camera.mode,
+        state.camera.target,
+        // The terrain toggle moves every car vertically; a window resize
+        // changes the profile canvas geometry. Both can happen while paused.
+        map.getTerrain() ? 1 : 0,
+        window.innerWidth,
+        window.innerHeight,
+      ].join('|');
+    }
+
     function frame(now: number) {
       const realDeltaSeconds = lastTime === null ? 0 : (now - lastTime) / 1000;
       lastTime = now;
 
       tick(state.sim, realDeltaSeconds);
 
-      const selectedCar = resolveCameraTargetCar(state.sim.cars, state.camera.mode === 'follow' ? state.camera.target : null);
+      // `sim` identity, not just its clock: Reset builds a new race that also
+      // starts at simTime 0, and the HUD has to rebuild for the new car set.
+      const key = `${renderKey()}|${simGeneration}`;
+      if (key === lastRenderKey) {
+        requestAnimationFrame(frame);
+        return;
+      }
+      lastRenderKey = key;
+
+      const selectedCar = resolveCameraTargetCar(
+        state.sim.cars,
+        state.camera.mode === 'follow' ? state.camera.target : null,
+        state.sim.simTime,
+      );
 
       // One interpolateAt per car per frame (P1) — map markers, follow
       // camera, HUD elevation, and profile dots all read from this instead
@@ -259,17 +438,28 @@ async function bootstrap() {
           const sample = samples.get(car.spec.id)!;
           return {
             id: car.spec.id,
+            type: car.spec.type,
             lon: sample.lon,
             lat: sample.lat,
+            // Both are render-only, derived from route geometry at the car's
+            // `s` — they place and orient the 3D model. The sim knows neither.
+            ele: sample.ele,
+            heading: headingAt(car.route, car.s, CAR_HEADING_WINDOW_M),
             colour: car.spec.colour,
             selected: car === selectedCar,
           };
         }),
+        now,
       );
 
       if (state.camera.mode === 'follow' && selectedCar) {
         const sample = samples.get(selectedCar.spec.id)!;
-        followCar(map, sample.lon, sample.lat);
+        // Heading comes straight from route geometry at the car's `s` — the
+        // sim has no notion of it, same as lon/lat. The camera's window is
+        // wider than the car models' (CAMERA_HEADING_WINDOW_M is headingAt's
+        // default), so this is a second, genuinely different lookup — not a
+        // repeat of the one above.
+        followCar(map, sample.lon, sample.lat, headingAt(selectedCar.route, selectedCar.s));
       }
 
       // HUD text is ~8 cells × N cars of textContent writes — throttled to
@@ -278,8 +468,9 @@ async function bootstrap() {
       hudAccumulator += realDeltaSeconds;
       if (hudAccumulator >= HUD_INTERVAL_S) {
         hudAccumulator = 0;
-        hud.render(state.sim.cars, state.camera, samples);
+        hud.render(state.sim.cars, state.camera, samples, state.sim.simTime);
       }
+      summary.update(state.sim);
       raceControls.render({
         simTime: state.sim.simTime,
         timeScale: state.sim.timeScale,
@@ -289,10 +480,15 @@ async function bootstrap() {
 
       // F1: the elevation profile can only show one road at a time — the
       // followed car's route if we're following someone, else the leader's.
-      const primaryCar = selectedCar ?? (state.sim.cars.length > 0 ? resolveLeader(state.sim.cars) : null);
-      if (primaryCar) {
-        const carsOnPrimaryRoute = state.sim.cars.filter((c) => c.route === primaryCar.route);
-        profile.render(primaryCar.route, carsOnPrimaryRoute, samples);
+      profileAccumulator += realDeltaSeconds;
+      if (profileAccumulator >= PROFILE_INTERVAL_S) {
+        profileAccumulator = 0;
+        const primaryCar =
+          selectedCar ?? (state.sim.cars.length > 0 ? resolveLeader(state.sim.cars, state.sim.simTime) : null);
+        if (primaryCar) {
+          const carsOnPrimaryRoute = state.sim.cars.filter((c) => c.route === primaryCar.route);
+          profile.render(primaryCar.route, carsOnPrimaryRoute, samples, selectedCar ?? undefined);
+        }
       }
 
       requestAnimationFrame(frame);

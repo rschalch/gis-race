@@ -30,8 +30,10 @@ check: typecheck test ## Type-check and run tests
 bake: ## Bake a route: make bake ARGS='--from "Origin, ST" --to "Destination, ST" --slug my-route-slug'
 	npm run bake -- $(ARGS)
 
+
 sim-batch: ## Run headless batch validation: make sim-batch ARGS='--route sorocaba-campos --seeds 30'
 	npm run sim-batch -- $(ARGS)
+
 
 clean: ## Remove build output and installed dependencies
 	rm -rf dist node_modules

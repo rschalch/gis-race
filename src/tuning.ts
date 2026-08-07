@@ -19,7 +19,17 @@ import type { Weather } from './types';
 // Phase 4 (R11-R14) — R13's unconditional per-step reliability draw alone
 // reshuffles every car's rng stream, so every seed produces a different
 // race than it did on v2.
-export const ENGINE_VERSION = 3;
+// v4 makes two changes, either of which alone would change every seed:
+// (a) R10's speed-limit tolerance splits out of `aggression` into its own
+//     `limitTolerance` spec field, changing every car's target speed on
+//     limit-bound road (i.e. nearly the whole of a typical route); and
+// (b) CORNER_UTILISATION_TARGET gives the cornering plan a risk margin it
+//     never had, changing every car's target speed on corner-bound road.
+// Between them, no seed replays the same race across the v3/v4 boundary.
+// v5 adds R5's committed-pass model, whose per-step commitment draw is taken
+// unconditionally for every racing car — that alone reshuffles every car's rng
+// stream from the first step, on top of the changed passing behaviour itself.
+export const ENGINE_VERSION = 5;
 
 export const G = 9.81; // m/s²
 
@@ -94,6 +104,59 @@ export const BRAKE_BUDGET_FLOOR = 0.3;
 export const CRASH_K = 0.03;
 export const CRASH_EXP = 1.6;
 
+/**
+ * §7.1/§7.3: the friction-circle utilisation an `aggression = 1.00` driver
+ * *plans* to corner at. Applied inside the sqrt in computeSpeedProfileUncached
+ * (U ∝ v², so the speed scales by sqrt of this).
+ *
+ * Without it, the planned cornering speed was exactly the grip limit — i.e.
+ * U = 1.000 — which sits ABOVE SLIDE_UTILISATION_THRESHOLD (0.95). A neutral
+ * 1.00-aggression driver therefore spent the entire duration of every
+ * corner inside the crash-probability region, and one sigma of the ordinary
+ * §7.4 misjudgement noise pushed a 1.06-aggression driver to U = 1.204 —
+ * over OFFROAD_UTILISATION_THRESHOLD, i.e. an instant retirement roll.
+ *
+ * Diagnosed from real incident data rather than inferred: over 6 seeds on the
+ * shipped 225 km route, 23 of 24 crash incidents landed in a single 9 km
+ * mountain stretch (km 198-207), and the measured utilisation cluster
+ * (1.19-1.23) reproduces `aggression 1.06 × 1σ noise` to three digits. Only
+ * 1 of 24 involved a sharp radius change across a grid cell, ruling out the
+ * 25 m route sampling as the cause.
+ *
+ * Any value below SLIDE_UTILISATION_THRESHOLD puts a neutral driver under the
+ * threshold while leaving `aggression > 1` doing exactly what types.ts
+ * documents it to do — targeting speeds above what the tyres can hold, and
+ * therefore crashing sometimes. This is the "risk margin" §7.3 always
+ * described; it just had no constant, so the margin was zero.
+ *
+ * Swept per §0.4 (30 seeds, 28-car roster, shipped 225 km route, dry):
+ *
+ *   T     slide+spin/car-race   off-road retirements   mean peak U
+ *   0.90  0.033                 0.12%                  1.021
+ *   0.93  0.050                 1.43%                  1.078
+ *   0.95  0.055                 1.31%                  1.110
+ *   (pre-fix, no constant at all: 0.117 and 3.81%, peak U 1.192)
+ *
+ * IMPORTANT — §0.4's two pass criteria cannot both be met on this content.
+ * It asks for slide+spin in 0.2-0.4 per car-race AND off-road ≤ 2%. Those
+ * rates are not independent: severity is decided by where a single
+ * utilisation distribution falls across the slide/spin/off-road thresholds,
+ * so reaching 0.2 slide+spin requires ~4x the probability mass that gives
+ * 0.055 here, which drags off-road to roughly 5-7% — three times its own
+ * ceiling. The 0.2-0.4 band was also written for a 14-car roster; per *race*
+ * it now lands 5-11 incidents across 28 cars, which is not "rare" by any
+ * reading.
+ *
+ * 0.93 resolves that in favour of the ≤2% off-road ceiling (the criterion
+ * that actually removes cars from a race) and the standing user preference
+ * for rare incidents, accepting slide+spin below the stale band. It is chosen
+ * over 0.90 because 0.90 makes a crash-caused retirement essentially never
+ * happen (1 in 840 car-races — roughly one per thirty races), which is not
+ * "rare", it is absent. 0.93 gives ~1.4 incidents and ~0.4 crash retirements
+ * per 28-car race: notable when they happen, not weather.
+ */
+export const CORNER_UTILISATION_TARGET = 0.93;
+
 /** Friction-circle utilisation thresholds (§7.5) separating a harmless
  * moment of grip loss from a spin from a full off-road retirement. */
 export const SLIDE_UTILISATION_THRESHOLD = 0.95;
@@ -103,6 +166,27 @@ export const OFFROAD_UTILISATION_THRESHOLD = 1.2;
 export const SLIDE_TIME_LOST_S = 2; // seconds of no throttle; car stays 'racing'
 export const SPIN_RECOVERY_MIN_S = 15;
 export const SPIN_RECOVERY_MAX_S = 40;
+
+/**
+ * Interval start: simulated seconds between successive cars leaving the line
+ * (0 = mass start, everyone away together).
+ *
+ * A mass start puts the entire roster on the same point of road at s=0, v=0.
+ * With a 28-car field that is not a grid, it is a pile: every car is inside
+ * every other car's blocking and drafting radius from the first step, and the
+ * event log filled with ~423 logged overtakes per race that were position
+ * swaps inside one clump rather than racing.
+ *
+ * A rally-style interval start is also the format that actually matches this
+ * simulation: the race is a point-to-point run down a public road, and the 1D
+ * model has no lateral dimension in which a grid could exist. It costs no new
+ * simulation state beyond a per-car release time — see CarState.startDelay.
+ *
+ * 30 s spreads a 28-car field over 13.5 minutes of a ~2.5 h race. Because
+ * results are scored on each car's OWN running time (see CarState.finishTime),
+ * the stagger does not advantage an early starter.
+ */
+export const START_INTERVAL_S = 30;
 
 // R4: slipstream (drafting) — reduced aero drag when closely following
 // another racing car on the same route. Drag at road-car speeds is modest,
@@ -117,6 +201,29 @@ export const BLOCK_GAP_M = 12; // start checking for a blocking leader within th
 export const BLOCK_MIN_GAP_M = 6; // never let the gap close tighter than this
 export const BLOCK_FOLLOW_FACTOR = 0.98; // follower's speed relative to the leader's while blocked
 export const PASS_MIN_RADIUS_M = 350; // road this open lets the follower simply drive by
+
+/**
+ * R5 (revised): committed overtaking on road that is NOT simply open.
+ *
+ * The original model was binary — radius > PASS_MIN_RADIUS_M meant a pass
+ * happened instantly and for free, anything tighter meant it could never
+ * happen at all, so a quicker car sat behind a slower one indefinitely with
+ * no way through and no decision ever being made. Real overtaking on a road
+ * is a *commitment*: you sit behind, you get impatient, you pick a moment,
+ * and for a few seconds you are somewhere you would rather not be.
+ *
+ * The model: once held up for PASS_PATIENCE_S, the follower draws each step
+ * against a hazard rate that scales with how much faster it is and how open
+ * the road is. On committing it gets PASS_DURATION_S of not being held
+ * back — and, for exactly that long, a reduced effective cornering radius
+ * (PASS_LINE_PENALTY), because it is off the good line. That penalty feeds
+ * the ordinary friction-circle check, so a pass committed into a tightening
+ * corner carries a real risk of ending badly, with no separate crash path.
+ */
+export const PASS_PATIENCE_S = 4; // held up this long before the driver starts looking for a way by
+export const PASS_COMMIT_RATE_PER_S = 0.6; // base hazard rate once impatient, on road at PASS_MIN_RADIUS_M
+export const PASS_DURATION_S = 6; // how long a committed pass takes to complete
+export const PASS_LINE_PENALTY = 0.85; // effective cornering radius multiplier while off the line
 
 // R5: two cars within a few percent of each other's pace can trade the
 // lead many times a second purely from §7.4 noise (verified empirically:
@@ -146,6 +253,94 @@ export const WEATHER_GRIP: Record<Weather, number> = { dry: 1.0, damp: 0.85, wet
 // (spray, reduced visibility, less confident feedback through the wheel) —
 // scales spec.errorSigma at its one use site in driverControl.
 export const WEATHER_ERROR_MULT: Record<Weather, number> = { dry: 1.0, damp: 1.3, wet: 1.6 };
+
+// --- M1: motorcycles ------------------------------------------------------
+//
+// Everything in this block applies only to `spec.type === 'motorcycle'`, and
+// every use site falls back to the car value above for cars — so adding
+// motorcycles to the roster does not change what any existing seed produces
+// for a field of cars (guarded by src/golden.test.ts).
+
+/**
+ * A motorcycle's own weather-grip table, replacing WEATHER_GRIP for bikes.
+ *
+ * Rain costs a motorcycle far more than a car, and the reason is geometric
+ * rather than a question of tyre compound: cornering force on two wheels comes
+ * from lean angle, a wet surface reduces the lean the rider dares carry, and
+ * there is no fourth-contact-patch margin for a slide to be caught in. Riders
+ * respond by backing off much harder than drivers do — which this table
+ * models directly, since the same multiplier scales both the plan and the
+ * crash check (see WEATHER_GRIP's note).
+ */
+export const MOTORCYCLE_WEATHER_GRIP: Record<Weather, number> = { dry: 1.0, damp: 0.78, wet: 0.58 };
+
+/**
+ * Default pitch-over ceiling (see CarSpec.pitchLimitG) for a motorcycle whose
+ * JSON entry doesn't state one, in g.
+ *
+ * 1.1 g is the usual quoted braking (stoppie) threshold for a modern
+ * sportbike; long, low machines (Hayabusa, cruisers, tourers) carry more and
+ * override it per bike. Note this sits *below* what the tyres could deliver —
+ * that is the point of the constant.
+ */
+export const MOTORCYCLE_PITCH_LIMIT_G = 1.1;
+
+/**
+ * CORNER_UTILISATION_TARGET's motorcycle counterpart — how much of the
+ * available cornering grip a rider actually plans to use.
+ *
+ * Lower than a car's 0.93 because the consequences are not symmetric: a driver
+ * who overcooks a corner scrubs wide, a rider who does the same is on the
+ * ground. Riders carry visibly more margin on a public road, and modelling it
+ * here rather than only in the crash check matters — with bikes planning to a
+ * car's margin, a wet race retired 44% of the motorcycle field (measured, 12
+ * seeds), which is not "riskier in the rain", it is unraceable. At 0.88 a bike
+ * is a little slower through every corner in exchange for staying on the road,
+ * which is the trade a real rider makes.
+ */
+export const MOTORCYCLE_CORNER_UTILISATION_TARGET = 0.88;
+
+/**
+ * How far a motorcycle's incident-severity thresholds shift down (in
+ * friction-circle utilisation) relative to a car's.
+ *
+ * The same loss of grip has a categorically worse outcome on two wheels: a car
+ * that steps out is usually a moment and a lost second, whereas a bike that
+ * loses the front is on the ground. Shifting SPIN/OFFROAD down rather than
+ * adding a separate crash path means one utilisation distribution still
+ * decides everything — a bike simply falls into the worse band sooner.
+ *
+ * Calibrated against the sim-batch protocol (§0.4), and the first value tried
+ * (0.06) was far too harsh: combined with R11 wear — a bike ends a 225 km race
+ * with ~0.85 tyre wear against a car's ~0.65, and worn tyres raise utilisation
+ * for the same speed — it retired 83% of the motorcycle field in the wet. The
+ * failures were all late-race, at U just past the shifted threshold (measured:
+ * off-road at 203 km, U = 1.16 against a 1.14 ceiling). 0.03 keeps the
+ * qualitative difference (a car's spin is a bike's retirement across that
+ * band) without making the last third of a wet race a lottery.
+ */
+export const MOTORCYCLE_SEVERITY_SHIFT = 0.03;
+
+/** A downed rider is not back up in the seconds a spun car needs — a
+ * motorcycle's spin recovery is scaled by this. */
+export const MOTORCYCLE_RECOVERY_MULT = 1.6;
+
+/**
+ * R11 tyre wear multiplier for motorcycles.
+ *
+ * Two contact patches the size of a credit card each, carrying the same job
+ * four much larger ones do on a car, and a sport tyre run at racing lean
+ * angles is a consumable measured in hundreds of kilometres. Wear costs grip
+ * through the same R11 channel, so this shows up as a bike fading late in a
+ * long race — the counterweight to its acceleration advantage.
+ *
+ * 1.3, not the 1.7 first tried: at 1.7 every motorcycle on the shipped 225 km
+ * route finished with tireWear pinned at exactly 1.00 (measured — a Gold Wing
+ * included), which is the model saturating rather than differentiating. Cars
+ * finish that route around 0.65; 1.3 puts bikes near 0.85 — clearly worse off,
+ * still on the part of the curve where how hard they were ridden matters.
+ */
+export const TIRE_WEAR_MOTORCYCLE_MULT = 1.3;
 
 // R11: tire degradation. Wear accumulates per metre travelled — a base rate
 // (rolling scrub, present even cruising) plus a load-dependent term scaled

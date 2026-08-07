@@ -1,4 +1,5 @@
-import type { CarSpec } from './types';
+import type { CarSpec, VehicleType } from './types';
+import { MOTORCYCLE_PITCH_LIMIT_G } from './tuning';
 
 // F2: the roster lives in public/data/cars.json (raw, real-world units —
 // crank power in W, top speed in km/h) rather than committed here as code,
@@ -7,9 +8,9 @@ import type { CarSpec } from './types';
 //   - crr, muLong, muLat: rolling resistance and grip are tire/road/condition
 //     properties, not published vehicle specs — estimated from tire class
 //     and vehicle dynamics (sport/performance vs. standard vs. truck tyres).
-//   - aggression, errorSigma: driver-behaviour parameters (§7.3–7.4), not a
-//     property of the car at all — set per how a car in that category is
-//     typically actually driven, not sourced from anywhere.
+//   - aggression, limitTolerance, errorSigma: driver-behaviour parameters
+//     (§7.3–7.4), not a property of the car at all — set per how a car in that
+//     category is typically actually driven, not sourced from anywhere.
 //
 // power is at the wheels (§9's convention): crank power × 0.85 drivetrain
 // loss, applied uniformly for consistency even though EVs lose less.
@@ -20,6 +21,13 @@ const KMH_TO_MS = 1 / 3.6;
 interface RawCarSpec {
   id: string;
   name: string;
+  /** M1: defaults to 'car' when omitted, so every pre-motorcycle entry in the
+   * JSON keeps its exact meaning. */
+  type?: VehicleType;
+  /** M1: pitch-over ceiling in g. Motorcycles fall back to
+   * MOTORCYCLE_PITCH_LIMIT_G; cars ignore it entirely (Infinity). */
+  pitchLimitG?: number;
+  make?: string; // manufacturer; defaults to the first word of `name` when omitted
   colour?: string; // optional (F2) — auto-assigned from a palette when omitted
   mass: number;
   crankPowerW: number;
@@ -31,6 +39,9 @@ interface RawCarSpec {
   aggression: number;
   errorSigma: number;
   lineQuality?: number; // R3: 1.00–1.15, defaults to 1.05 when omitted
+  limitTolerance?: number; // R10: 0.95–1.10, defaults to 1.00 (obeys the signs)
+                           // when omitted. Split out of `aggression` — see the
+                           // note on CarSpec.limitTolerance in types.ts.
   induction?: 'na' | 'forced'; // R9: defaults to 'forced' (no altitude derate) when omitted
   peakPowerSpeed?: number; // R14: m/s, defaults to 5 (pre-R14 behaviour) when omitted
   notes?: string;
@@ -39,6 +50,14 @@ interface RawCarSpec {
 const LINE_QUALITY_DEFAULT = 1.05;
 const LINE_QUALITY_MIN = 1.0;
 const LINE_QUALITY_MAX = 1.15;
+// Default 1.00 = drives exactly to the posted limit. The band is deliberately
+// narrower than aggression's: on a mostly limit-tagged route this multiplier
+// applies to nearly every point in the profile, so a wide spread here drowns
+// out every actual car stat (which is precisely the bug that split it out of
+// `aggression` — see types.ts).
+const LIMIT_TOLERANCE_DEFAULT = 1.0;
+const LIMIT_TOLERANCE_MIN = 0.95;
+const LIMIT_TOLERANCE_MAX = 1.1;
 const INDUCTION_DEFAULT = 'forced';
 const PEAK_POWER_SPEED_DEFAULT = 5;
 
@@ -74,6 +93,9 @@ function assertCars(value: unknown): asserts value is RawCarSpec[] {
     if (seenIds.has(car.id as string)) fail(`duplicate car id "${car.id}"`);
     seenIds.add(car.id as string);
     if (typeof car.name !== 'string' || car.name.length === 0) fail(`car "${car.id}" is missing a name`);
+    if (car.make !== undefined && (typeof car.make !== 'string' || car.make.length === 0)) {
+      fail(`car "${car.id}" has an empty make`);
+    }
     for (const field of REQUIRED_NUMERIC_FIELDS) {
       if (!Number.isFinite(car[field])) fail(`car "${car.id}" has a non-finite ${field}`);
     }
@@ -82,8 +104,30 @@ function assertCars(value: unknown): asserts value is RawCarSpec[] {
         fail(`car "${car.id}" has lineQuality outside [${LINE_QUALITY_MIN}, ${LINE_QUALITY_MAX}]`);
       }
     }
+    if (car.limitTolerance !== undefined) {
+      if (
+        typeof car.limitTolerance !== 'number' ||
+        car.limitTolerance < LIMIT_TOLERANCE_MIN ||
+        car.limitTolerance > LIMIT_TOLERANCE_MAX
+      ) {
+        fail(`car "${car.id}" has limitTolerance outside [${LIMIT_TOLERANCE_MIN}, ${LIMIT_TOLERANCE_MAX}]`);
+      }
+    }
     if (car.induction !== undefined && car.induction !== 'na' && car.induction !== 'forced') {
       fail(`car "${car.id}" has induction outside 'na'/'forced'`);
+    }
+    if (car.type !== undefined && car.type !== 'car' && car.type !== 'motorcycle') {
+      fail(`car "${car.id}" has type outside 'car'/'motorcycle'`);
+    }
+    if (car.pitchLimitG !== undefined) {
+      if (typeof car.pitchLimitG !== 'number' || !(car.pitchLimitG > 0)) {
+        fail(`car "${car.id}" has a non-positive pitchLimitG`);
+      }
+      if (car.type !== 'motorcycle') {
+        // Not merely unused — silently ignored. A car entry carrying one is
+        // someone expecting it to do something, so say so rather than eat it.
+        fail(`car "${car.id}" sets pitchLimitG but is not a motorcycle`);
+      }
     }
     if (car.peakPowerSpeed !== undefined && (typeof car.peakPowerSpeed !== 'number' || car.peakPowerSpeed <= 0)) {
       fail(`car "${car.id}" has a non-positive peakPowerSpeed`);
@@ -120,6 +164,12 @@ export function buildCarSpecs(raw: unknown): CarSpec[] {
   return raw.map((car, i) => ({
     id: car.id,
     name: car.name,
+    type: car.type ?? 'car',
+    // Cars have no pitch-over mode, and Infinity makes the cap in physics.ts
+    // an exact no-op for them rather than an "effectively large" number.
+    pitchLimitG:
+      (car.type ?? 'car') === 'motorcycle' ? (car.pitchLimitG ?? MOTORCYCLE_PITCH_LIMIT_G) : Infinity,
+    make: car.make ?? car.name.split(' ')[0]!,
     colour: colourFor(i, car.colour),
     mass: car.mass,
     power: car.crankPowerW * CRANK_TO_WHEEL,
@@ -131,6 +181,7 @@ export function buildCarSpecs(raw: unknown): CarSpec[] {
     aggression: car.aggression,
     errorSigma: car.errorSigma,
     lineQuality: car.lineQuality ?? LINE_QUALITY_DEFAULT,
+    limitTolerance: car.limitTolerance ?? LIMIT_TOLERANCE_DEFAULT,
     induction: car.induction ?? INDUCTION_DEFAULT,
     peakPowerSpeed: car.peakPowerSpeed ?? PEAK_POWER_SPEED_DEFAULT,
   }));

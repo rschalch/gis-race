@@ -65,6 +65,42 @@ If rates drift out of band, prefer fixing the *behaviour* (e.g. lookahead tuning
 
 ---
 
+### 0.6 Addendum — findings that postdate R1-R14
+
+Added after a validation pass against the *shipped* content (28-car roster on
+the 225 km Sorocaba-Monte Verde route) rather than the 14-car/sorocaba-campos
+configuration the original constants were tuned on. Read alongside §0.4.
+
+- **§0.4's two pass criteria cannot both be satisfied here.** It asks for
+  slide+spin in 0.2-0.4 per car-race *and* off-road retirements ≤ 2%. Those are
+  not independent: severity is decided by where one utilisation distribution
+  falls across the slide/spin/off-road thresholds, so pushing slide+spin up to
+  0.2 drags off-road to roughly 5-7%. The ≤2% ceiling wins (it is the criterion
+  that removes cars from a race, and it matches the standing preference for
+  rare incidents); slide+spin currently sits below the stated band. The 0.2-0.4
+  figure also predates the roster doubling — per *race* it now means 5-11
+  incidents across 28 cars, which is not "rare" on any reading.
+
+- **The cornering plan had no risk margin at all.** `computeSpeedProfile`
+  targeted exactly the grip limit, so an `aggression = 1.00` driver planned
+  every binding corner at U = 1.000 — above `SLIDE_UTILISATION_THRESHOLD`
+  (0.95) for the whole corner. `CORNER_UTILISATION_TARGET` now supplies that
+  margin. See its comment in `tuning.ts` for the measured evidence and sweep.
+
+- **`aggression` was doing two unrelated jobs.** It scaled both the cornering
+  plan and the tolerance to posted speed limits. On a route that is ~90%
+  limit-tagged the second use dominated finish times, so cornering bravery
+  outweighed power, mass, drag and grip combined. Split into `limitTolerance`
+  — keep them separate.
+
+- **Validation is cheap now.** `tools/sim-batch.ts` runs seeds across worker
+  threads (~4x). There is no longer a reason to skip the §0.4 protocol after a
+  phase. `src/golden.test.ts` additionally pins one whole race end-to-end, so
+  unintended behaviour drift fails `make check` rather than being discovered
+  later.
+
+---
+
 ## Phase 1 — Driver model (fix the two big fudges)
 
 The current controller is purely reactive (`driver.ts:81-116`): it brakes only once `v` exceeds the interpolated target. Two consequences: `BRAKE_SAFETY_MARGIN = 0.5` throws away half the braking capability to compensate for zero anticipation (see the long comment in `tuning.ts:18-28`), and throttle is commanded with no knowledge of lateral load, so mid-corner throttle overshoot is a major *artificial* crash source. Fix the behaviour, then reclaim the margin.
@@ -273,3 +309,90 @@ One commit (or PR) per item ID, each passing `make check` + the relevant §0.4 b
 `sim-batch harness` → R1 → R2 → R3 → *(snapshot refactor)* → R4 → R5 → R6 → R7 → R9 → R8+R10 (shared Overpass work) → R11 → R12 → R13 → R14.
 
 Each PR description must include: batch incident-rate table (before/after, per severity), any constant changed and why, and — where §0.1 applies — an `ENGINE_VERSION` bump per the cross-version note in §0.1 (one bump per PR that changes seed outcomes; no bump for pure refactors like the §0.3 snapshot commit, which the batch must prove behaviour-identical).
+
+---
+
+## M1 — Motorcycles (added after R1-R14)
+
+Motorcycles race the same one-dimensional `(s, v)` simulation as cars. Nothing
+about the model changed to accommodate them: `CarSpec.type` selects between a
+handful of type-gated branches, and every one of them falls back to the car
+value for `type: 'car'`. `src/golden.test.ts` passes unchanged across this
+work, which is the evidence that car races are bit-identical.
+
+### The four differences
+
+| Difference | Where | Why |
+| --- | --- | --- |
+| **Pitch-over ceiling** (`spec.pitchLimitG`) | `physics.ts`, and `brakeCapability` in `driver.ts` | A bike lifts a wheel before it slides one. Acceleration *and* braking are capped at a geometric limit (1.0–1.45 g by machine) that sits below what the tyres could give — which is why a 200 hp/280 kg superbike cannot deploy its power at low speed and cannot out-brake a good car. `Infinity` for cars makes both `Math.min` calls exact no-ops. |
+| **Weather** (`MOTORCYCLE_WEATHER_GRIP`) | `weatherGripFor` in `driver.ts` | Cornering force comes from lean angle, and a wet road takes lean away with no fourth contact patch to catch the slide. 0.58 wet against a car's 0.70. |
+| **Rider margin** (`MOTORCYCLE_CORNER_UTILISATION_TARGET`) | profile build | A rider plans to 0.88 of the grip limit where a driver plans to 0.93 — the consequences are not symmetric. This is also what makes wet racing survivable; see the calibration note on the constant. |
+| **Consequences** (`MOTORCYCLE_SEVERITY_SHIFT`, `MOTORCYCLE_RECOVERY_MULT`, `TIRE_WEAR_MOTORCYCLE_MULT`) | `triggerIncident`, `stepCar` | One utilisation distribution still decides severity; a bike just reaches the worse band 0.03 sooner, stays down 1.6× longer, and wears its tyres 1.3× faster. |
+
+### Measured outcome (shipped 225 km route, 12 seeds, four superbikes against four supercars)
+
+- **Dry:** superbikes 8,614–8,626 s, supercars 8,713–8,724 s — the bikes win by
+  about 95 s (1.1 %).
+- **Wet:** the cars win by roughly 150 s, with far wider spread on the bikes.
+- Incident rates over 30 seeds, dry: cars 0.096 crash-related per car-race,
+  bikes 0.092. Retirements are dominated by R13 mechanical failures at ~4 % for
+  both — a **pre-existing** rate on this route, not something M1 introduced, and
+  above §0.4's ≤2 % criterion for cars just as much as for bikes.
+- Wet bikes collect slides rather than retirements (1.4/race): at full step rate
+  their utilisation distribution is *tighter* than a car's, but it dwells in the
+  0.9–1.0 band where slides are drawn.
+
+### Calibration history (things that did not work)
+
+- `TIRE_WEAR_MOTORCYCLE_MULT = 1.7` pinned every bike's `tireWear` at exactly
+  1.00 by the end of the route, including a Gold Wing — the model saturating
+  instead of differentiating. 1.3 lands them near 0.85.
+- `MOTORCYCLE_SEVERITY_SHIFT = 0.06` retired 83 % of the motorcycle field in the
+  wet, almost all late-race at U just past the shifted ceiling, because R11 wear
+  raises utilisation exactly when the ceiling is lowest.
+- Rider `errorSigma` was first set at 0.040–0.045 against a car mean of 0.032,
+  on no evidence. Riders are not sloppier than drivers about speed; ×1.6 wet
+  amplification then made that noise alone the dominant crash source. Now
+  0.026–0.035.
+
+### Verification pass
+
+The roster was audited a second time by working the physics backwards from
+each entry rather than re-reading the spec sheets, and that found errors the
+first pass could not have caught by inspection. `src/roster-data.test.ts` now
+runs the whole audit on every `make check`, so none of it can silently return.
+
+**The pitch ceiling was inert on the machines it was written for.** Superbikes
+were authored with `muLong` 1.05 against a `pitchLimitG` of 1.10 — so tyre grip
+bound first, and M1's headline constraint did nothing at all on any sportbike.
+Real sport rubber is good for ~1.25 g while the bike lifts a wheel at ~1.1 g,
+which is the entire point. Sport, naked, track and electric archetypes now
+carry `muLong` 1.15–1.30, and 35 of 50 bikes are genuinely pitch-limited; the
+other 15 (Hayabusa, ZX-14R, cruisers, adventure bikes) stay traction-limited,
+which is correct for long, low or soft-tyred machines. Two tests pin which
+group each machine belongs to.
+
+**14 of 50 quoted top speeds were unreachable** on the bike's own power and
+drag — brochure claims rather than measured figures. Corrected against tested
+numbers: a Honda CB1000R measures 230 km/h, not 250 (its speedometer reads
+154 mph where the bike is doing 143); a KTM 1290 Super Duke R is GPS-verified
+around 268–280 against a 289 claim; the Ninja H2R's real figure is Kawasaki's
+own 380 km/h with 326 hp on ram air — the famous 400 km/h was a speedometer
+reading on a closed bridge, unverified, on a probably non-stock bike. Where the
+machine really does hit its claim (MV Agusta Brutale 1000 RR), the drag area
+was lowered instead, since that claim assumes a rider flat on the tank.
+
+**`muLat` is `tan(lean angle)` on two wheels**, so every cornering coefficient
+is a checkable claim about geometry. The implied angles came out at 48° for a
+superbike and 41° for an adventure bike (both right), but 34° for a cruiser and
+38° for a full tourer — more lean than either can carry before hard parts
+touch down. Now 32° and 36°.
+
+**The acceleration model is optimistic, and it is not a motorcycle problem.**
+Modelled 0–100 km/h runs fast against published figures by a mean of 1.25 s
+across 22 cars, worst at the slow end (Fiat Uno −6.8 s, Mobi −5.2 s, Camry
+−3.1 s) — R14's constant-torque region has no clutch or gearing model. The
+bikes sit inside that same band (Gold Wing −1.4 s, R6 −0.7 s), and superbikes
+actually land closer to reality than the cars do (2.78–2.96 s modelled against
+2.9–3.1 s published). Left alone deliberately: distorting motorcycle data to
+compensate for a roster-wide property of R14 would hide it.

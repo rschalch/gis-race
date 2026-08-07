@@ -9,7 +9,10 @@ export function formatElapsed(simSeconds: number): string {
 }
 
 export function formatDistance(metres: number): string {
-  if (metres < 1000) return `${metres.toFixed(0)} m`;
+  // Magnitude, not the raw value, picks the unit: a negative distance (the
+  // leaderboard's signed gap can produce one) would otherwise always take the
+  // metres branch and render as "-1500 m" instead of "-1.5 km".
+  if (Math.abs(metres) < 1000) return `${metres.toFixed(0)} m`;
   return `${(metres / 1000).toFixed(1)} km`;
 }
 

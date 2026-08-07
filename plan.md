@@ -30,10 +30,26 @@ alternative without flagging it first.
 
 ### Explicitly out of scope
 
-- 3D rendering, car models, textures.
-- Player-controlled driving. All 5 cars are AI-driven. (Adding a human
+> **Historical — parts of this list have been superseded.** This document is
+> the *original* spec, kept as a record of the decisions the project started
+> from. Several items below were later implemented deliberately, and the list
+> is annotated rather than rewritten so the original intent stays legible.
+> Where this section and the code disagree, the code and `REALISM-GUIDE.md`
+> are authoritative. The **guiding principle** immediately below this list is
+> the one thing here that has NOT changed and must not be treated as stale.
+
+- ~~3D rendering, car models, textures.~~ **Superseded.** Cars are drawn as 3D
+  meshes via deck.gl's `SimpleMeshLayer`, interleaved into MapLibre's own
+  WebGL context, with a chase camera and 3D terrain. See `src/render/cars-3d.ts`,
+  `car-mesh.ts`, `chase-camera.ts`. The simulation stayed 1D throughout — this
+  is a rendering change only, which is exactly why it was safe to make.
+- Player-controlled driving. All cars are AI-driven. (Adding a human
   throttle/brake later is a small change — see §11.)
-- Gearboxes, engine RPM curves, tyre temperature, fuel, weather.
+- ~~Gearboxes, engine RPM curves,~~ tyre temperature, ~~fuel, weather.~~
+  **Partly superseded.** R14 added a constant-torque/constant-power split
+  (`peakPowerSpeed`) as a coarse per-gear approximation — not an RPM curve.
+  R7 added weather as a race-level grip multiplier. Tyre *temperature* and
+  fuel remain out of scope; tyre **wear** was added by R11.
 - Traffic, junctions, traffic lights, other road users.
 - Multiplayer, persistence, accounts.
 
@@ -51,15 +67,25 @@ simulation state. This single decision is what keeps the project small.
 | Concern | Choice | Notes |
 |---|---|---|
 | Build | Vite + TypeScript, no UI framework | Vanilla DOM is sufficient. Do **not** add React. |
-| Map rendering | MapLibre GL JS v4+ | Same library GeoLibre is built on. |
+| Map rendering | MapLibre GL JS v5 (pinned) | v5 specifically: it added the `sky` style property, and v6 removes the internal `map.transform` that `@deck.gl/mapbox` reads. See the pin note at the top of `src/render/map.ts`. |
+| 3D car models | `@deck.gl/mesh-layers`, interleaved | Added after the original spec — see the amendment below the table. |
 | Basemap | OpenFreeMap `liberty` style | `https://tiles.openfreemap.org/styles/liberty` — free, no API key, no signup. |
-| Routing (build-time only) | OSRM public demo server | `router.project-osrm.org` |
+| Routing (build-time only) | Valhalla primary, OSRM demo fallback | See `tools/bakeRoute.ts`. |
 | Elevation (build-time only) | OpenTopoData public API, SRTM 30m | `api.opentopodata.org` — free, rate-limited to 1 req/s, 100 points/req. |
 | Geometry maths | Hand-written, ~150 lines | Turf.js is optional and probably unnecessary. |
 
-**No game engine.** Unity, Godot, Unreal, Phaser, and Three.js are all
-inappropriate here — the view is top-down, the cars never leave the road, and
-there are five of them. The entire "engine" is a fixed-timestep integrator.
+**No game engine.** Unity, Godot, Unreal and Phaser are all inappropriate
+here — the cars never leave the road, and the entire "engine" is a
+fixed-timestep integrator.
+
+> **Amended.** The "top-down, so no 3D library" reasoning no longer holds: the
+> view is now a pitched chase camera, and `@deck.gl/mesh-layers` draws the car
+> models. deck.gl was chosen precisely because it is *not* a game engine — it
+> renders into MapLibre's existing WebGL context and depth buffer, so cars are
+> occluded correctly by terrain and buildings without a second scene graph. The
+> rule this line was really protecting — no engine owning the game loop, no
+> second source of truth for state — still stands: the fixed-timestep
+> integrator in `sim.ts` remains the only simulation, and deck.gl only draws.
 
 ### The critical build-time / runtime split
 

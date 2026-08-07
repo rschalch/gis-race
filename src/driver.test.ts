@@ -5,11 +5,15 @@ import { mulberry32, valueNoise } from './rng';
 import { makeTestRoute, TEST_CAR } from './test-fixtures';
 import {
   BRAKE_SAFETY_MARGIN,
+  CORNER_UTILISATION_TARGET,
+  GLOBAL_CAP,
+  SLIDE_UTILISATION_THRESHOLD,
   WEATHER_GRIP,
   SLIDE_GRIP_DAMAGE,
   SPIN_GRIP_DAMAGE,
   SPIN_CDA_DAMAGE,
   CONDITION_GRIP_FLOOR,
+  PASS_LINE_PENALTY,
 } from './tuning';
 import type { CarState } from './types';
 
@@ -21,11 +25,36 @@ describe('computeSpeedProfile', () => {
     });
     const profile = computeSpeedProfile(route, TEST_CAR, true, 'dry');
     for (let i = 0; i < route.points.length; i++) {
-      const vCorner = Math.sqrt(TEST_CAR.muLat * 9.81 * route.points[i]!.radius * TEST_CAR.lineQuality);
+      const vCorner = Math.sqrt(
+        TEST_CAR.muLat * 9.81 * route.points[i]!.radius * TEST_CAR.lineQuality * CORNER_UTILISATION_TARGET,
+      );
       const uncapped = Math.min(vCorner * TEST_CAR.aggression, TEST_CAR.vMax);
-      const vLimit = Math.min(uncapped, 36); // global cap enabled
+      const vLimit = Math.min(uncapped, GLOBAL_CAP * TEST_CAR.limitTolerance); // global cap enabled
       expect(profile[i]!).toBeLessThanOrEqual(vLimit + 1e-6);
     }
+  });
+
+  // The defect this guards: an aggression-1.00 driver used to plan every
+  // binding corner at U = 1.000, above SLIDE_UTILISATION_THRESHOLD, so a
+  // neutral driver was permanently inside the crash-probability region.
+  it('plans a neutral driver strictly below the slide threshold in a binding corner', () => {
+    const route = makeTestRoute({ n: 200, radiusAt: () => 40 });
+    const neutral = { ...TEST_CAR, id: 'neutral', aggression: 1.0 };
+    const profile = computeSpeedProfile(route, neutral, false, 'dry');
+    // Utilisation the plan implies, computed the way evaluateLossOfControl does.
+    const v = profile[100]!;
+    const U = (v * v) / (40 * neutral.lineQuality) / (neutral.muLat * 9.81);
+    expect(U).toBeLessThan(SLIDE_UTILISATION_THRESHOLD);
+    expect(U).toBeCloseTo(CORNER_UTILISATION_TARGET, 3);
+  });
+
+  it('still lets an aggression > 1 driver plan above the limit, as documented', () => {
+    const route = makeTestRoute({ n: 200, radiusAt: () => 40 });
+    const bold = { ...TEST_CAR, id: 'bold-corner', aggression: 1.08 };
+    const profile = computeSpeedProfile(route, bold, false, 'dry');
+    const v = profile[100]!;
+    const U = (v * v) / (40 * bold.lineQuality) / (bold.muLat * 9.81);
+    expect(U).toBeGreaterThan(SLIDE_UTILISATION_THRESHOLD);
   });
 
   it('respects backward-pass reachability: profile[i] never exceeds what braking from profile[i+1] allows', () => {
@@ -167,7 +196,9 @@ describe('R10: per-way speed limits', () => {
     const zoned = computeSpeedProfile(zoneRoute, TEST_CAR, true, 'dry');
     // Well inside the zone, away from the backward-pass transition at its edges.
     expect(zoned[25]!).toBeLessThan(uncapped[25]!);
-    expect(zoned[25]!).toBeLessThanOrEqual(15 * TEST_CAR.aggression + 1e-6);
+    // limitTolerance, NOT aggression — the two were one field until the
+    // former was split out; see the decoupling suite below.
+    expect(zoned[25]!).toBeLessThanOrEqual(15 * TEST_CAR.limitTolerance + 1e-6);
   });
 
   it('an untagged fixture is identical to today\'s flat-GLOBAL_CAP output', () => {
@@ -186,6 +217,54 @@ describe('R10: per-way speed limits', () => {
     // Straight, wide-open radius: uncapped speed should sit near vMax, far
     // above the tagged 10 m/s limit, since the toggle is off.
     expect(profile[25]!).toBeGreaterThan(20);
+  });
+});
+
+describe('R10: limitTolerance is independent of aggression', () => {
+  // Regression suite for the defect that made these one field. On the shipped
+  // 225 km route ~90% of points carry a tagged limit, so the limit term sets
+  // the profile almost everywhere — with the two conflated, cornering bravery
+  // became the dominant determinant of finish time and inverted the field
+  // (Civic Type R first, 2000 hp U9 Xtreme last behind an F-150, 15 seeds).
+  const limitedRoute = () => makeTestRoute({ n: 50, limitAt: () => 20 });
+
+  it('raising aggression alone does not raise the profile on limit-bound road', () => {
+    const route = limitedRoute();
+    const timid = computeSpeedProfile(route, { ...TEST_CAR, id: 'timid', aggression: 0.88 }, true, 'dry');
+    const bold = computeSpeedProfile(route, { ...TEST_CAR, id: 'bold', aggression: 1.06 }, true, 'dry');
+    // Straight road (default radius 3000) under a 20 m/s limit: the limit
+    // binds for both, so the cornering trait must not move the target at all.
+    for (let i = 0; i < route.points.length; i++) {
+      expect(bold[i]!).toBeCloseTo(timid[i]!, 6);
+    }
+    expect(bold[25]!).toBeCloseTo(20, 6);
+  });
+
+  it('raising limitTolerance alone does raise it, in proportion', () => {
+    const route = limitedRoute();
+    const obeys = computeSpeedProfile(route, { ...TEST_CAR, id: 'obeys', limitTolerance: 1.0 }, true, 'dry');
+    const pushes = computeSpeedProfile(route, { ...TEST_CAR, id: 'pushes', limitTolerance: 1.06 }, true, 'dry');
+    // 4dp, not more: profiles are Float32Array, which carries ~7 significant
+    // decimal digits — a 6dp assertion on a value above 10 exceeds that.
+    expect(pushes[25]!).toBeCloseTo(20 * 1.06, 4);
+    expect(pushes[25]!).toBeGreaterThan(obeys[25]!);
+  });
+
+  it('applies tolerance to the GLOBAL_CAP fallback too, so untagged road is not the one place everyone drives alike', () => {
+    const untagged = makeTestRoute({ n: 50 }); // no limit field anywhere
+    const obeys = computeSpeedProfile(untagged, { ...TEST_CAR, id: 'obeys2', limitTolerance: 1.0 }, true, 'dry');
+    const pushes = computeSpeedProfile(untagged, { ...TEST_CAR, id: 'pushes2', limitTolerance: 1.06 }, true, 'dry');
+    expect(obeys[25]!).toBeCloseTo(GLOBAL_CAP, 4);
+    expect(pushes[25]!).toBeCloseTo(GLOBAL_CAP * 1.06, 4);
+  });
+
+  it('still separates cars by cornering when the corner, not the limit, is what binds', () => {
+    // Tight radius with a limit far too high to bind: aggression must be the
+    // thing that matters here, exactly as before the split.
+    const corner = makeTestRoute({ n: 50, radiusAt: () => 40, limitAt: () => 90 });
+    const timid = computeSpeedProfile(corner, { ...TEST_CAR, id: 'timid3', aggression: 0.88 }, true, 'dry');
+    const bold = computeSpeedProfile(corner, { ...TEST_CAR, id: 'bold3', aggression: 1.06 }, true, 'dry');
+    expect(bold[25]!).toBeGreaterThan(timid[25]!);
   });
 });
 
@@ -353,6 +432,44 @@ describe('R11: tire-wear driver adaptation', () => {
   });
 });
 
+describe('R5: a committed pass costs cornering margin', () => {
+  function makeCar(overrides: Partial<CarState> = {}): CarState {
+    return {
+      spec: TEST_CAR,
+      route: makeTestRoute({ n: 2 }),
+      s: 0,
+      v: 0,
+      throttle: 0,
+      brake: 0,
+      status: 'racing',
+      recoveryRemaining: 0,
+      incidents: [],
+      startDelay: 0,
+      heldUpFor: 0,
+      passRemaining: 0,
+      finishTime: null,
+      speedProfile: new Float32Array(1),
+      rng: () => 0.999, // never trips the crash roll — this test reads the returned U
+      seed: 1,
+      tireWear: 0,
+      condition: { grip: 1, cdA: 1 },
+      ...overrides,
+    };
+  }
+
+  it('reports higher friction-circle utilisation mid-pass than on the good line, at identical speed', () => {
+    const route = makeTestRoute({ n: 50, radiusAt: () => 120 });
+    const onLine = makeCar({ v: 25, s: 500, passRemaining: 0 });
+    const midPass = makeCar({ v: 25, s: 500, passRemaining: 3 });
+    const uOnLine = evaluateLossOfControl(onLine, route, 0, 0, 1 / 60, 'dry');
+    const uMidPass = evaluateLossOfControl(midPass, route, 0, 0, 1 / 60, 'dry');
+    expect(uMidPass).toBeGreaterThan(uOnLine);
+    // Radius scales by PASS_LINE_PENALTY and U goes as 1/radius, so the
+    // utilisation ratio is exactly its reciprocal.
+    expect(uMidPass / uOnLine).toBeCloseTo(1 / PASS_LINE_PENALTY, 6);
+  });
+});
+
 describe('evaluateLossOfControl', () => {
   function makeCar(overrides: Partial<CarState> = {}): CarState {
     return {
@@ -365,6 +482,9 @@ describe('evaluateLossOfControl', () => {
       status: 'racing',
       recoveryRemaining: 0,
       incidents: [],
+      startDelay: 0,
+      heldUpFor: 0,
+      passRemaining: 0,
       finishTime: null,
       speedProfile: new Float32Array(1),
       rng: mulberry32(1),
@@ -425,6 +545,9 @@ describe('R12: persistent incident damage', () => {
       status: 'racing',
       recoveryRemaining: 0,
       incidents: [],
+      startDelay: 0,
+      heldUpFor: 0,
+      passRemaining: 0,
       finishTime: null,
       speedProfile: new Float32Array(1),
       rng: () => 0, // forces any above-threshold incident to actually fire

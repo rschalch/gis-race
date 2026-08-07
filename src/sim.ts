@@ -10,6 +10,9 @@ import {
   BLOCK_MIN_GAP_M,
   BLOCK_FOLLOW_FACTOR,
   PASS_MIN_RADIUS_M,
+  PASS_PATIENCE_S,
+  PASS_COMMIT_RATE_PER_S,
+  PASS_DURATION_S,
   OVERTAKE_COOLDOWN_S,
   CAUTION_DURATION_S,
   CAUTION_AHEAD_M,
@@ -19,6 +22,7 @@ import {
   ENGINE_VERSION,
   TIRE_WEAR_BASE_PER_M,
   TIRE_WEAR_LOAD_PER_M,
+  TIRE_WEAR_MOTORCYCLE_MULT,
   TIRE_WEAR_MAX_GRIP_LOSS,
   RELIABILITY_BASE_PER_S,
   RELIABILITY_LOAD_PER_S,
@@ -124,9 +128,19 @@ export function createSim(
   raceSeed = 1,
   globalCapEnabled = true,
   weather: Weather = 'dry',
+  // Defaults to 0 (mass start) rather than START_INTERVAL_S: the race format
+  // is the application's choice, not something the engine should impose on
+  // every caller. main.ts passes the configured value; unit tests that place
+  // cars relative to each other get an unstaggered field for free.
+  startIntervalS = 0,
 ): Sim {
-  const cars: CarState[] = assignments.map(({ spec, route }) => {
+  const cars: CarState[] = assignments.map(({ spec, route }, index) => {
     const seed = deriveCarSeed(raceSeed, spec.id);
+    // Release order is roster order — the order the config panel produced,
+    // which is the only ordering the sim is given. Deliberately NOT derived
+    // from the rng: a start order that reshuffles on reseed would make two
+    // runs of the same roster incomparable for no gain.
+    const startDelay = index * startIntervalS;
     return {
       spec,
       route,
@@ -134,9 +148,12 @@ export function createSim(
       v: 0,
       throttle: 0,
       brake: 0,
-      status: 'racing',
+      status: startDelay > 0 ? 'staged' : 'racing',
       recoveryRemaining: 0,
       incidents: [],
+      startDelay,
+      heldUpFor: 0,
+      passRemaining: 0,
       finishTime: null,
       speedProfile: computeSpeedProfile(route, spec, globalCapEnabled, weather),
       rng: mulberry32(seed),
@@ -179,15 +196,81 @@ export function remainingDistance(car: CarState): number {
   return car.route.totalDistance - car.s;
 }
 
+/** Simulated seconds this car has been running: race clock minus its own
+ * interval-start delay. Zero while staged. */
+export function runningTime(car: CarState, simTime: number): number {
+  return Math.max(0, simTime - car.startDelay);
+}
+
+/**
+ * The score cars are *ranked* on: projected own-running-time for the full
+ * route, in seconds. Lower is better.
+ *
+ * Under an interval start, position on the road is not position in the race —
+ * a car two minutes up the road may simply have left the line two minutes
+ * earlier. What decides a point-to-point road race is each car's own elapsed
+ * time, so ranking extrapolates the time it has taken so far over the
+ * distance it still has to cover. Finished cars score their actual time, so
+ * they can never be displaced by an extrapolation.
+ *
+ * A finished car always outranks an unfinished one, and a car still at the
+ * line (or retired, whose distance has stopped updating) scores Infinity.
+ * Early-race extrapolations from a few hundred metres are noisy for the first
+ * minute or so and then settle; that is inherent to any live rally timing
+ * that isn't split-based, and the alternative — ranking by road position —
+ * is not noisy, just wrong.
+ */
+export function projectedTime(car: CarState, simTime: number): number {
+  if (car.status === 'finished' && car.finishTime !== null) return car.finishTime;
+  if (car.status === 'retired' || car.status === 'staged') return Infinity;
+  if (car.s <= 0) return Infinity;
+  return runningTime(car, simTime) * (car.route.totalDistance / car.s);
+}
+
+/**
+ * Field ordered best-to-worst by `projectedTime`, ties broken by distance
+ * covered so the ordering is total and stable.
+ */
+export function raceRank(cars: CarState[], simTime: number): CarState[] {
+  // Decorate-sort-undecorate. The obvious version calls projectedTime from
+  // inside the comparator, which recomputes the same car's key O(log n) times
+  // per sort — and this is on the render path, called for every HUD tick.
+  const keyed = cars.map((car) => ({
+    car,
+    time: projectedTime(car, simTime),
+    remaining: remainingDistance(car),
+  }));
+  keyed.sort((a, b) => (a.time !== b.time ? a.time - b.time : a.remaining - b.remaining));
+  return keyed.map((k) => k.car);
+}
+
 // A retired (crashed-out) car should never be "the leader" — its distance
 // stops updating, so it would otherwise stay P1/camera target forever.
 // Finished cars still count: they're ahead by definition until every other
-// car finishes too. Falls back to the overall least-remaining car only if
-// every car has retired (no non-retired car exists to lead).
-export function resolveLeader(cars: CarState[]): CarState {
-  const active = cars.filter((c) => c.status !== 'retired');
-  const pool = active.length > 0 ? active : cars;
-  return pool.reduce((a, b) => (remainingDistance(b) < remainingDistance(a) ? b : a));
+// car finishes too. Falls back to the overall best-ranked car only if every
+// car has retired (no non-retired car exists to lead).
+export function resolveLeader(cars: CarState[], simTime: number): CarState {
+  // Only the best-ranked car is wanted, so this is a linear min-scan rather
+  // than raceRank's sort — it runs once per animation frame while the camera
+  // follows the leader, and previously allocated two arrays and sorted the
+  // whole field to read one element. The ordering rule is raceRank's exactly,
+  // including its tie-break and (via strict `<`) a stable sort's "earliest in
+  // input order wins" among fully equal cars.
+  const anyActive = cars.some((c) => c.status !== 'retired');
+  let best: CarState | null = null;
+  let bestTime = Infinity;
+  let bestRemaining = Infinity;
+  for (const car of cars) {
+    if (anyActive && car.status === 'retired') continue;
+    const time = projectedTime(car, simTime);
+    const remaining = remainingDistance(car);
+    if (best === null || time < bestTime || (time === bestTime && remaining < bestRemaining)) {
+      best = car;
+      bestTime = time;
+      bestRemaining = remaining;
+    }
+  }
+  return best!;
 }
 
 const DRAFT_STATUSES: readonly CarStatus[] = ['racing'];
@@ -274,6 +357,17 @@ function coastToStop(car: CarState, dt: number): void {
 function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): void {
   if (car.status === 'finished') return;
 
+  // Interval start: sit at the line until this car's release time. Checked
+  // before every other branch so a staged car runs no physics, draws no
+  // hazard, and cannot be drafted or blocked against (its status is excluded
+  // from DRAFT_STATUSES/BLOCK_STATUSES for the same reason).
+  if (car.status === 'staged') {
+    if (simTime < car.startDelay) return;
+    car.status = 'racing';
+    ctx.events.push({ time: simTime, type: 'start', carId: car.spec.id });
+    // Fall through: the car is away this step, no step wasted at the line.
+  }
+
   if (car.status === 'retired') {
     if (car.v === 0) return;
     coastToStop(car, dt);
@@ -329,6 +423,15 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
   const hazardRate = reliabilityHazardRate(car.throttle);
   const pFailureThisStep = 1 - Math.exp(-hazardRate * dt);
   const mechanicalFailure = car.rng() < pFailureThisStep;
+
+  // R5: the overtake-commitment draw, taken here — unconditionally, for every
+  // racing car, immediately after the reliability draw — for the same §0.1
+  // reason that one is unconditional. Whether the car is actually behind
+  // anyone depends on float comparisons against gap thresholds; gating the
+  // *draw* on those would let a last-ulp difference shift every subsequent
+  // draw in the stream. Gating only the *use* of an already-drawn value is
+  // safe, because the stream layout no longer depends on the outcome.
+  const passDraw = car.rng();
   if (mechanicalFailure) {
     car.throttle = 0;
     car.brake = MECHANICAL_COAST_BRAKE;
@@ -363,20 +466,68 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
   // §6.2: semi-implicit Euler — update v first, then s.
   car.v = Math.max(0, Math.min(car.v + a * dt, car.spec.vMax));
 
-  // R5: blocking — a slower same-route car ahead caps closing speed unless
-  // the road opens up enough to pass. Deliberately between the v-update and
-  // the s-update, so the clamp affects this step's distance travelled, not
-  // next step's. A spinning leader (off at the roadside) is never blocked
-  // against — only tracked so the overtake event below still fires for it.
+  // R5: blocking and overtaking — a slower same-route car ahead caps closing
+  // speed unless the road opens up, or the driver commits to going around.
+  // Deliberately between the v-update and the s-update, so the clamp affects
+  // this step's distance travelled, not next step's. A spinning leader (off
+  // at the roadside) is never blocked against — only tracked so the overtake
+  // event below still fires for it.
   const blockLeader = nearestAhead(ctx.snapshot, ctx.index, car.route, car.s, BLOCK_GAP_M, BLOCK_STATUSES);
-  if (blockLeader && blockLeader.status === 'racing' && blockLeader.v < car.v) {
-    const canPass = radiusAt(car.route, car.s) > PASS_MIN_RADIUS_M;
-    if (!canPass) {
-      const projectedGap = blockLeader.s - (car.s + car.v * dt);
-      if (projectedGap < BLOCK_MIN_GAP_M) {
-        car.v = blockLeader.v * BLOCK_FOLLOW_FACTOR;
+
+  if (car.passRemaining > 0) {
+    // Mid-pass: committed, alongside, and explicitly NOT speed-capped by the
+    // car being passed. The cost of being here is paid in the friction circle
+    // (PASS_LINE_PENALTY, applied in evaluateLossOfControl), not in speed.
+    car.passRemaining = Math.max(0, car.passRemaining - dt);
+  } else if (blockLeader && blockLeader.status === 'racing') {
+    const radius = radiusAt(car.route, car.s);
+    // How fast this car WANTS to be going here — read off its own frozen
+    // speed profile, not its current v. Using v would be self-defeating: the
+    // blocking clamp below pins the follower to 0.98x the leader's speed, so
+    // one step later it measures as *slower* than the car holding it up,
+    // patience resets, and no driver ever becomes impatient enough to try
+    // anything. (That is exactly what happened — heldUpFor oscillated between
+    // 0 and one step's worth of dt for an entire race.)
+    const profileIdx = Math.min(Math.floor(car.s / car.route.spacing), car.speedProfile.length - 1);
+    const desiredSpeed = car.speedProfile[profileIdx]!;
+    if (radius > PASS_MIN_RADIUS_M || desiredSpeed <= blockLeader.v) {
+      // Road wide open (just drive by, unchanged), or the car ahead is not
+      // actually in the way — either way there is nothing to be patient about.
+      car.heldUpFor = 0;
+    } else {
+      car.heldUpFor += dt;
+      // Impatience builds before anything is attempted: a driver who has been
+      // behind for a moment is still assessing, not lunging.
+      if (car.heldUpFor >= PASS_PATIENCE_S) {
+        // Two things make a driver go: a clear speed advantage, and road
+        // that is at least somewhat open. `openness` is 0 at a hairpin and 1
+        // at the free-pass threshold, so commitment tails off to nothing in
+        // the tightest corners rather than stopping at a hard edge.
+        // Squared, not linear: linear openness made even a hairpin passable
+        // inside ~20 s of following, which is not what a hairpin is. Squaring
+        // keeps commitment quick just below the free-pass threshold (radius
+        // 300 -> ~2 s of patience) and vanishingly rare in genuinely tight
+        // corners (radius 30 -> minutes), without a second hard cutoff.
+        const openness = Math.min(1, Math.max(0, radius / PASS_MIN_RADIUS_M)) ** 2;
+        // Ramped to full effect by a 10% speed advantage: a car barely faster
+        // than the one ahead has no reason to risk anything. Measured against
+        // desiredSpeed for the same reason as above.
+        const speedAdvantage = (desiredSpeed - blockLeader.v) / Math.max(blockLeader.v, 1);
+        const rate = PASS_COMMIT_RATE_PER_S * openness * Math.min(1, speedAdvantage / 0.1);
+        if (passDraw < 1 - Math.exp(-Math.max(0, rate) * dt)) {
+          car.passRemaining = PASS_DURATION_S;
+          car.heldUpFor = 0;
+        }
+      }
+      if (car.passRemaining === 0 && blockLeader.v < car.v) {
+        const projectedGap = blockLeader.s - (car.s + car.v * dt);
+        if (projectedGap < BLOCK_MIN_GAP_M) {
+          car.v = blockLeader.v * BLOCK_FOLLOW_FACTOR;
+        }
       }
     }
+  } else {
+    car.heldUpFor = 0;
   }
 
   const sBeforeStep = car.s;
@@ -399,7 +550,10 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
   if (car.s >= car.route.totalDistance) {
     car.s = car.route.totalDistance;
     car.status = 'finished';
-    car.finishTime = simTime;
+    // Own running time, not absolute race clock — under an interval start a
+    // late starter's absolute finish is later by construction, and scoring on
+    // it would hand the win to whoever left the line first.
+    car.finishTime = simTime - car.startDelay;
     ctx.events.push({ time: simTime, type: 'finish', carId: car.spec.id });
     return;
   }
@@ -427,7 +581,10 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
   // utilisation (cornering/braking hard wears faster than cruising).
   // Deliberately after the crash check, using the load that actually
   // occurred this step, not next step's.
-  const wearRate = TIRE_WEAR_BASE_PER_M + TIRE_WEAR_LOAD_PER_M * utilisation * utilisation;
+  // M1: two credit-card contact patches doing four tyres' work — a bike eats
+  // its tyres faster, and R11 turns that into late-race grip loss.
+  const wearMult = car.spec.type === 'motorcycle' ? TIRE_WEAR_MOTORCYCLE_MULT : 1;
+  const wearRate = (TIRE_WEAR_BASE_PER_M + TIRE_WEAR_LOAD_PER_M * utilisation * utilisation) * wearMult;
   car.tireWear = Math.min(1, car.tireWear + wearRate * car.v * dt);
 
   if (car.incidents.length > incidentCountBefore) {
@@ -501,7 +658,9 @@ export function tick(sim: Sim, realDeltaSeconds: number): void {
   }
 
   // R13: a mechanically-retired car can still have v > 0 (coasting to a
-  // stop) — the race isn't over while one is still visibly rolling.
+  // stop) — the race isn't over while one is still visibly rolling. A staged
+  // car has not even started, so it also keeps the race alive (its status is
+  // neither of the two terminal ones, so this is already handled).
   if (sim.cars.every((c) => c.status === 'finished' || (c.status === 'retired' && c.v === 0))) {
     sim.raceOver = true;
     sim.paused = true;

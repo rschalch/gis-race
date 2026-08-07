@@ -11,6 +11,7 @@ import {
   BRAKE_BUDGET_FLOOR,
   WEATHER_GRIP,
   WEATHER_ERROR_MULT,
+  CORNER_UTILISATION_TARGET,
   CRASH_K,
   CRASH_EXP,
   SLIDE_UTILISATION_THRESHOLD,
@@ -24,7 +25,47 @@ import {
   SPIN_GRIP_DAMAGE,
   SPIN_CDA_DAMAGE,
   CONDITION_GRIP_FLOOR,
+  PASS_LINE_PENALTY,
+  MOTORCYCLE_WEATHER_GRIP,
+  MOTORCYCLE_CORNER_UTILISATION_TARGET,
+  MOTORCYCLE_SEVERITY_SHIFT,
+  MOTORCYCLE_RECOVERY_MULT,
 } from './tuning';
+
+/**
+ * M1: the weather grip multiplier this vehicle actually experiences.
+ *
+ * Motorcycles read their own (harsher) table — see MOTORCYCLE_WEATHER_GRIP.
+ * Every site that composes grip goes through here, so the plan, the runtime
+ * controller and the crash check cannot disagree about how wet the road is for
+ * a given machine (the failure mode WEATHER_GRIP's own note warns about).
+ */
+export function weatherGripFor(spec: CarSpec, weather: Weather): number {
+  return (spec.type === 'motorcycle' ? MOTORCYCLE_WEATHER_GRIP : WEATHER_GRIP)[weather];
+}
+
+/**
+ * Usable braking deceleration, in m/s², at a point of given grade.
+ *
+ * Shared by the profile's backward pass and the runtime controller's `aCap` so
+ * planning and execution agree on what the vehicle can actually do — they were
+ * two copies of one formula, and M1 adds a second term to it: braking is
+ * capped by the pitch-over (stoppie) ceiling as well as by tyre grip, which is
+ * why a superbike with far better tyres than a hot hatch does not out-brake
+ * one. `Infinity` for cars leaves the expression exactly as it was.
+ *
+ * The 0.5 floor: a steep-downhill point under low grip (wet × unpaved × worn
+ * tyres) can otherwise push this to zero or negative, and a negative cap both
+ * trips the brake trigger for any aReqMax and flips brake = aReqMax/aCap
+ * negative — which survives the final clamp and reaches physics as thrust.
+ */
+function brakeCapability(spec: CarSpec, gripMultiplier: number, grade: number): number {
+  const tyreLimited = spec.muLong * gripMultiplier * G * Math.cos(grade);
+  return Math.max(
+    0.5,
+    Math.min(tyreLimited, spec.pitchLimitG * G) * BRAKE_SAFETY_MARGIN + G * Math.sin(grade),
+  );
+}
 
 // Speed profiles are pure functions of (route, spec, globalCapEnabled) and
 // immutable once built — safe to share the same Float32Array across cars
@@ -59,7 +100,7 @@ export function computeSpeedProfile(
     byKey = new Map();
     speedProfileCache.set(route, byKey);
   }
-  const key = `${spec.id}:${globalCapEnabled}:${spec.lineQuality}:${weather}`;
+  const key = `${spec.id}:${globalCapEnabled}:${spec.lineQuality}:${spec.limitTolerance}:${weather}`;
   const cached = byKey.get(key);
   if (cached) return cached;
 
@@ -75,7 +116,7 @@ function computeSpeedProfileUncached(
   weather: Weather,
 ): Float32Array {
   const n = route.points.length;
-  const weatherGrip = WEATHER_GRIP[weather];
+  const weatherGrip = weatherGripFor(spec, weather);
 
   // Step 1 — cornering limit, Step 2 — aggression + (optional) global cap.
   // R3: lineQuality widens the radius the driver plans against (straightening
@@ -86,18 +127,45 @@ function computeSpeedProfileUncached(
   // established — gravel under a dry sky drives like a wet asphalt corner,
   // physically the same effect (less usable friction), so one multiplier.
   const vLimit = new Float32Array(n);
+  // M1: a rider plans with more margin than a driver — see
+  // MOTORCYCLE_CORNER_UTILISATION_TARGET.
+  const utilisationTarget =
+    spec.type === 'motorcycle' ? MOTORCYCLE_CORNER_UTILISATION_TARGET : CORNER_UTILISATION_TARGET;
   for (let i = 0; i < n; i++) {
     const point = route.points[i]!;
     const gripMultiplier = weatherGrip * (point.surface ?? 1);
-    const vCorner = Math.sqrt(spec.muLat * gripMultiplier * G * point.radius * spec.lineQuality);
+    // CORNER_UTILISATION_TARGET sits inside the sqrt because utilisation goes
+    // as v²: planning for U = 0.90 means planning for sqrt(0.90) ≈ 0.949 of
+    // the grip-limited speed. Without it the plan aimed at U = 1.000 exactly,
+    // i.e. above the slide threshold for the whole of every binding corner —
+    // see the constant's note in tuning.ts for the measured evidence.
+    const vCorner = Math.sqrt(
+      spec.muLat * gripMultiplier * G * point.radius * spec.lineQuality * utilisationTarget,
+    );
     const uncapped = Math.min(vCorner * spec.aggression, spec.vMax);
     // R10: a tagged legal limit replaces the flat GLOBAL_CAP stand-in where
     // known, falling back to it where the road is untagged (real coverage
-    // is patchy — never fabricate a limit from road class). `aggression`
-    // doubles as the tolerance here (already calibrated <1 timid / >1
-    // pushes-the-limit for cornering — the same meaning applies to how far
-    // over a posted limit a driver runs), so no separate constant is needed.
-    const pointCap = point.limit !== undefined ? point.limit * spec.aggression : GLOBAL_CAP;
+    // is patchy — never fabricate a limit from road class).
+    //
+    // Scaled by `limitTolerance`, NOT `aggression`. Reusing `aggression` here
+    // (the original design) conflated two unrelated driver traits, and on a
+    // route that is ~90% limit-tagged the limit term dominates the profile
+    // almost everywhere — so cornering bravery silently became the single
+    // biggest determinant of finish time, ahead of power, mass, drag and
+    // grip combined. Measured over 15 seeds on the shipped 225 km route, that
+    // put a Civic Type R (aggression 1.06) first by 6 minutes and the
+    // 2000 hp U9 Xtreme (0.88) last of 28, behind a Ford F-150, while every
+    // aggression-1.00 car from a GR86 to a 720S finished within 80 s of each
+    // other. Tolerance now spans a deliberately narrow 0.98–1.06, so
+    // limit-bound sections bunch the field (which is what really happens on a
+    // speed-limited road) and the corners do the separating.
+    //
+    // The tolerance applies to the GLOBAL_CAP fallback too: that constant is
+    // itself a stand-in for a posted limit, so a driver who runs 4% over the
+    // signs should run 4% over the stand-in as well. Previously the fallback
+    // branch applied no multiplier at all, making untagged road the one place
+    // every driver behaved identically.
+    const pointCap = (point.limit ?? GLOBAL_CAP) * spec.limitTolerance;
     vLimit[i] = globalCapEnabled ? Math.min(uncapped, pointCap) : uncapped;
   }
 
@@ -110,10 +178,7 @@ function computeSpeedProfileUncached(
   for (let i = n - 2; i >= 0; i--) {
     const point = route.points[i]!;
     const gripMultiplier = weatherGrip * (point.surface ?? 1);
-    const aBrake = Math.max(
-      0.5,
-      spec.muLong * gripMultiplier * G * Math.cos(point.grade) * BRAKE_SAFETY_MARGIN + G * Math.sin(point.grade),
-    );
+    const aBrake = brakeCapability(spec, gripMultiplier, point.grade);
     const reachable = Math.sqrt(profile[i + 1]! * profile[i + 1]! + 2 * aBrake * route.spacing);
     profile[i] = Math.min(vLimit[i]!, reachable);
   }
@@ -148,7 +213,7 @@ export function driverControl(
   // R7/R8/R11/R12: weather × road-surface × condition grip, composed the
   // same way the profile build (weather/surface only — condition can't
   // rebuild a cached profile, §0.2) and evaluateLossOfControl compose it.
-  const gripMultiplier = WEATHER_GRIP[weather] * surfaceAt(route, s) * conditionGrip;
+  const gripMultiplier = weatherGripFor(spec, weather) * surfaceAt(route, s) * conditionGrip;
 
   // R11: the profile was built assuming conditionGrip = 1 (fresh tyres,
   // undamaged). Weather and surface are identical between build-time and
@@ -198,20 +263,12 @@ export function driverControl(
     }
   }
 
-  // Grade-corrected usable braking decel, matching the backward pass's form
-  // (computeSpeedProfileUncached) so planning and runtime agree on what the
-  // car can actually do — same BRAKE_SAFETY_MARGIN constant, and same 0.5
-  // floor: a steep-downhill point under low grip (wet × unpaved × worn
-  // tyres) can otherwise push aCap to zero or negative, and a negative aCap
-  // both trips the brake trigger for any aReqMax and flips
-  // brake = aReqMax/aCap negative — which survives the final min() clamp
-  // and reaches physics as forward thrust. R7: gripMultiplier derates it
-  // the same way the profile build does.
+  // Grade-corrected usable braking decel — the same brakeCapability the
+  // profile's backward pass used, so planning and runtime agree on what the
+  // vehicle can actually do. R7: gripMultiplier derates it the same way the
+  // profile build does.
   const grade = route.points[idx]!.grade;
-  const aCap = Math.max(
-    0.5,
-    spec.muLong * gripMultiplier * G * Math.cos(grade) * BRAKE_SAFETY_MARGIN + G * Math.sin(grade),
-  );
+  const aCap = brakeCapability(spec, gripMultiplier, grade);
 
   let raw: DriverOutput;
   if (aReqMax > BRAKE_TRIGGER_FRACTION * aCap) {
@@ -297,8 +354,17 @@ export function evaluateLossOfControl(
   // same weather × surface × condition gripMultiplier too — car.condition.grip
   // (R12's permanent damage) composes with tireWear's own grip loss (R11).
   const gripFromWear = 1 - TIRE_WEAR_MAX_GRIP_LOSS * car.tireWear;
-  const gripMultiplier = WEATHER_GRIP[weather] * surfaceAt(route, car.s) * car.condition.grip * gripFromWear;
-  const radius = radiusAt(route, car.s) * car.spec.lineQuality;
+  const gripMultiplier =
+    weatherGripFor(car.spec, weather) * surfaceAt(route, car.s) * car.condition.grip * gripFromWear;
+  // R5: a car mid-overtake is off the line it would otherwise take — around
+  // the outside, or squared off on the inside — so the radius it is actually
+  // driving is tighter than the one it plans against. Applied here and only
+  // here: the *plan* (computeSpeedProfile) is built for the good line, which
+  // is exactly the point. Committing to a pass into a tightening corner
+  // therefore costs friction-circle margin through the ordinary §7.5 check,
+  // with no separate crash path bolted on.
+  const passPenalty = car.passRemaining > 0 ? PASS_LINE_PENALTY : 1;
+  const radius = radiusAt(route, car.s) * car.spec.lineQuality * passPenalty;
   const aLat = (car.v * car.v) / radius;
   const gripAvailable = car.spec.muLat * gripMultiplier * G;
   const U = aLat / gripAvailable;
@@ -320,16 +386,28 @@ function triggerIncident(car: CarState, total: number, simTime: number): void {
   let severity: Incident['severity'];
   let timeLost: number;
 
-  if (total <= SPIN_UTILISATION_THRESHOLD) {
+  // M1: the same loss of grip is worse on two wheels — a moment that a car
+  // catches puts a bike on the ground. Both thresholds move down together, so
+  // one utilisation distribution still decides severity; a motorcycle just
+  // reaches the worse band sooner. (Cars: shift is 0, thresholds unchanged.)
+  const shift = car.spec.type === 'motorcycle' ? MOTORCYCLE_SEVERITY_SHIFT : 0;
+  const spinThreshold = SPIN_UTILISATION_THRESHOLD - shift;
+  const offroadThreshold = OFFROAD_UTILISATION_THRESHOLD - shift;
+  const recoveryMult = car.spec.type === 'motorcycle' ? MOTORCYCLE_RECOVERY_MULT : 1;
+
+  if (total <= spinThreshold) {
     severity = 'slide';
     car.v *= 0.6;
     car.recoveryRemaining = SLIDE_TIME_LOST_S; // seconds of no throttle, car stays 'racing'
     timeLost = SLIDE_TIME_LOST_S;
     // R12: flat-spotted tyres — mild, permanent, stacks across incidents.
     car.condition.grip = Math.max(CONDITION_GRIP_FLOOR, car.condition.grip * SLIDE_GRIP_DAMAGE);
-  } else if (total <= OFFROAD_UTILISATION_THRESHOLD) {
+  } else if (total <= offroadThreshold) {
     severity = 'spin';
-    const recovery = SPIN_RECOVERY_MIN_S + car.rng() * (SPIN_RECOVERY_MAX_S - SPIN_RECOVERY_MIN_S);
+    // The rng draw stays in the same place in the stream whatever the vehicle
+    // is; only the seconds it buys differ (§0.1).
+    const recovery =
+      (SPIN_RECOVERY_MIN_S + car.rng() * (SPIN_RECOVERY_MAX_S - SPIN_RECOVERY_MIN_S)) * recoveryMult;
     car.status = 'spinning';
     car.v = 0;
     car.recoveryRemaining = recovery;

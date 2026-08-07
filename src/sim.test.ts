@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { createSim, tick, resolveLeader, remainingDistance, reliabilityHazardRate } from './sim';
+import {
+  createSim,
+  tick,
+  resolveLeader,
+  remainingDistance,
+  reliabilityHazardRate,
+  raceRank,
+  projectedTime,
+  runningTime,
+} from './sim';
 import { radiusAt } from './route';
 import { makeTestRoute, TEST_CAR } from './test-fixtures';
 import { mulberry32 } from './rng';
@@ -11,6 +20,7 @@ import {
   CAUTION_BEHIND_M,
   ENGINE_VERSION,
   RELIABILITY_BASE_PER_S,
+  PASS_PATIENCE_S,
 } from './tuning';
 import type { CarState, Route } from './types';
 
@@ -36,6 +46,9 @@ describe('resolveLeader / remainingDistance (B3, F1)', () => {
       status: 'racing',
       recoveryRemaining: 0,
       incidents: [],
+      startDelay: 0,
+      heldUpFor: 0,
+      passRemaining: 0,
       finishTime: null,
       speedProfile: new Float32Array(1),
       rng: () => 0.5,
@@ -46,33 +59,94 @@ describe('resolveLeader / remainingDistance (B3, F1)', () => {
     };
   }
 
+  const NOW = 100; // arbitrary race clock for ranking
+
   it('ignores retired cars even if they are furthest along', () => {
     const crashed = makeCar({ s: 5000, status: 'retired' });
     const trailing = makeCar({ s: 3000, status: 'racing' });
-    expect(resolveLeader([crashed, trailing])).toBe(trailing);
+    expect(resolveLeader([crashed, trailing], NOW)).toBe(trailing);
   });
 
-  it('falls back to the overall least-remaining car when every car has retired', () => {
+  it('falls back to the overall furthest car when every car has retired', () => {
     const a = makeCar({ s: 5000, status: 'retired' });
     const b = makeCar({ s: 3000, status: 'retired' });
-    expect(resolveLeader([a, b])).toBe(a);
+    expect(resolveLeader([a, b], NOW)).toBe(a);
   });
 
   it('finished cars still count as leader', () => {
-    const finished = makeCar({ s: 5000, status: 'finished' });
-    const racing = makeCar({ s: 3000, status: 'racing' });
-    expect(resolveLeader([finished, racing])).toBe(finished);
+    // Distances here stay inside SHARED_ROUTE's actual length: once ranking is
+    // time-based, an `s` past the finish line no longer means "way ahead", it
+    // means a nonsensical projection.
+    const finished = makeCar({ s: SHARED_ROUTE.totalDistance, status: 'finished', finishTime: 50 });
+    const racing = makeCar({ s: SHARED_ROUTE.totalDistance * 0.2, status: 'racing' });
+    expect(resolveLeader([finished, racing], NOW)).toBe(finished);
   });
 
-  it('F1: compares by remaining distance, not raw s, across cars on different-length routes', () => {
-    // Car A is further along in absolute metres but has much further left to
-    // go on its (longer) route than car B — B should lead.
+  it('F1: compares across cars on different-length routes by projected time, not raw s', () => {
+    // Car A is further along in absolute metres but has proportionally more of
+    // its (longer) route still to run than car B — B should lead.
     const longRoute = makeTestRoute({ n: 400 }); // totalDistance = 399 * 25 = 9975
     const shortRoute = makeTestRoute({ n: 40 }); // totalDistance = 39 * 25 = 975
-    const carA = makeCar({ route: longRoute, s: 5000 }); // remaining ~4975
-    const carB = makeCar({ route: shortRoute, s: 500 }); // remaining ~475
+    const carA = makeCar({ route: longRoute, s: 5000 }); // ~50% done
+    const carB = makeCar({ route: shortRoute, s: 500 }); // ~51% done
     expect(remainingDistance(carB)).toBeLessThan(remainingDistance(carA));
-    expect(resolveLeader([carA, carB])).toBe(carB);
+    expect(resolveLeader([carA, carB], NOW)).toBe(carB);
+  });
+});
+
+describe('interval start: ranking by own running time', () => {
+  function makeCar(overrides: Partial<CarState> & { route?: Route }): CarState {
+    return {
+      spec: TEST_CAR,
+      route: SHARED_ROUTE,
+      s: 0,
+      v: 0,
+      throttle: 0,
+      brake: 0,
+      status: 'racing',
+      recoveryRemaining: 0,
+      incidents: [],
+      startDelay: 0,
+      heldUpFor: 0,
+      passRemaining: 0,
+      finishTime: null,
+      speedProfile: new Float32Array(1),
+      rng: () => 0,
+      seed: 1,
+      tireWear: 0,
+      condition: { grip: 1, cdA: 1 },
+      ...overrides,
+    };
+  }
+
+  // The point of the whole feature: road position is not race position once
+  // cars leave the line at different times.
+  it('ranks a later starter ahead of a road-leading early starter when it is running faster', () => {
+    const total = SHARED_ROUTE.totalDistance;
+    // At t=200s: early car left at t=0 and has run 200 s to cover 40% of the
+    // route. Late car left at t=100 and has covered 30% in only 100 s — twice
+    // the pace, so it is winning despite being well behind on the road.
+    const early = makeCar({ s: total * 0.4, startDelay: 0 });
+    const late = makeCar({ s: total * 0.3, startDelay: 100 });
+    expect(remainingDistance(early)).toBeLessThan(remainingDistance(late));
+    expect(projectedTime(late, 200)).toBeLessThan(projectedTime(early, 200));
+    expect(raceRank([early, late], 200)[0]).toBe(late);
+  });
+
+  it('scores a staged car as having no time yet, and ranks it last', () => {
+    const away = makeCar({ s: 100 });
+    const staged = makeCar({ s: 0, status: 'staged', startDelay: 500 });
+    expect(runningTime(staged, 200)).toBe(0);
+    expect(projectedTime(staged, 200)).toBe(Infinity);
+    expect(raceRank([staged, away], 200)[1]).toBe(staged);
+  });
+
+  it('a finished car is scored on its recorded own-time and cannot be displaced by an extrapolation', () => {
+    const finished = makeCar({ s: SHARED_ROUTE.totalDistance, status: 'finished', finishTime: 300 });
+    // Flying, but not actually done: any extrapolation must still rank behind.
+    const flying = makeCar({ s: SHARED_ROUTE.totalDistance * 0.99, startDelay: 0 });
+    expect(projectedTime(finished, 1000)).toBe(300);
+    expect(raceRank([flying, finished], 1000)[0]).toBe(finished);
   });
 });
 
@@ -311,25 +385,64 @@ describe('R5: blocking and overtaking', () => {
   const slowSpec = { ...TEST_CAR, id: 'slow', vMax: 15, errorSigma: 0, aggression: 1.0 };
   const fastSpec = { ...TEST_CAR, id: 'fast', errorSigma: 0, aggression: 1.0 };
 
-  it('keeps the gap to a slower car ahead at or above BLOCK_MIN_GAP_M on a tight road (no passing)', () => {
-    const route = makeTestRoute({ n: 6000, radiusAt: () => 200 }); // < PASS_MIN_RADIUS_M: passing never allowed
+  function twoCarSim(route: Route, seed = 1) {
     const sim = createSim(
       [
         { spec: fastSpec, route },
         { spec: slowSpec, route },
       ],
-      1,
+      seed,
       false,
     );
     sim.cars[1]!.s = 50; // slow car starts ahead
+    return sim;
+  }
 
-    for (let i = 0; i < 90 * 60; i++) tick(sim, DT);
+  it('holds station behind a slower car in a hairpin, where committing to a pass is not on', () => {
+    // Radius 40 is deep below PASS_MIN_RADIUS_M (squared openness makes the
+    // commitment rate tiny), but still loose enough that the corner limit is
+    // above the slow car's 15 m/s vMax — so the follower genuinely wants past
+    // and is queueing, rather than simply being corner-limited to the same
+    // speed as the car ahead.
+    const route = makeTestRoute({ n: 6000, radiusAt: () => 40 });
+    const sim = twoCarSim(route);
+
+    for (let i = 0; i < 45 * 60; i++) tick(sim, DT);
 
     const [fast, slow] = sim.cars as [CarState, CarState];
     const gap = slow.s - fast.s;
     expect(gap).toBeGreaterThanOrEqual(BLOCK_MIN_GAP_M - 1e-6);
     expect(gap).toBeLessThan(BLOCK_GAP_M * 3); // actually blocked, not cruising far apart
     expect(fast.v).toBeCloseTo(slow.v, 0); // converged to the leader's pace
+    expect(fast.heldUpFor).toBeGreaterThan(PASS_PATIENCE_S); // impatient, but not through
+  });
+
+  // The defect this replaces: below PASS_MIN_RADIUS_M a pass was flatly
+  // impossible, so a quicker car sat behind a slower one for the rest of the
+  // race with no decision ever taken.
+  it('eventually commits to a pass on merely-tightish road instead of queueing forever', () => {
+    const route = makeTestRoute({ n: 6000, radiusAt: () => 200 }); // below the free-pass threshold
+    const sim = twoCarSim(route);
+
+    for (let i = 0; i < 90 * 60; i++) tick(sim, DT);
+
+    const [fast, slow] = sim.cars as [CarState, CarState];
+    expect(fast.s).toBeGreaterThan(slow.s);
+    expect(sim.events.some((e) => e.type === 'overtake' && e.carId === 'fast')).toBe(true);
+  });
+
+  it('does not need to commit at all when the road is wide open', () => {
+    const route = makeTestRoute({ n: 6000, radiusAt: () => 5000 });
+    const sim = twoCarSim(route);
+
+    for (let i = 0; i < 90 * 60; i++) tick(sim, DT);
+
+    const [fast, slow] = sim.cars as [CarState, CarState];
+    expect(fast.s).toBeGreaterThan(slow.s);
+    // Open road is a drive-by, not a committed move: no patience accrues and
+    // the car is never off its line.
+    expect(fast.heldUpFor).toBe(0);
+    expect(fast.passRemaining).toBe(0);
   });
 
   it('allows passing and fires an overtake event once the road opens up', () => {

@@ -6,10 +6,13 @@
 
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { availableParallelism } from 'node:os';
+import { Worker, isMainThread, workerData, parentPort } from 'node:worker_threads';
 import { assertRoute, radiusAt, surfaceAt } from '../src/route';
 import { buildCarSpecs } from '../src/cars';
+import { MAX_FIELD_SIZE, PERFORMANCE_TIERS, buildFairField, tierOf } from '../src/roster';
 import { createSim, tick, type CarAssignment } from '../src/sim';
-import { G, WEATHER_GRIP } from '../src/tuning';
+import { G, WEATHER_GRIP, START_INTERVAL_S } from '../src/tuning';
 import type { CarSpec, Route, Weather } from '../src/types';
 
 const ROUTES_DIR = path.resolve('public/data/routes');
@@ -21,6 +24,30 @@ interface CliArgs {
   seeds: number;
   globalCap: boolean;
   weather: Weather;
+  jobs: number;
+  startIntervalS: number;
+  /** Which slice of the ~200-car roster to race — see resolveField. */
+  cars: string;
+}
+
+/** What the main thread hands each worker. The route is passed by *slug*, not
+ * as a parsed object: a 225 km route is ~9000 points, and structured-cloning
+ * that to every worker costs more than each worker re-reading the file. */
+interface WorkerInput {
+  route: string;
+  seeds: number[];
+  globalCap: boolean;
+  weather: Weather;
+  startIntervalS: number;
+  cars: string;
+}
+
+/** Results are tagged with their seed so the main thread can restore seed
+ * order — workers finish out of order, and while every statistic printed
+ * below is order-independent, an ordered array keeps output reproducible. */
+interface SeededResult {
+  seed: number;
+  result: RaceResult;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -39,12 +66,53 @@ function parseArgs(argv: string[]): CliArgs {
   if (!WEATHERS.includes(weather as Weather)) {
     throw new Error(`--weather must be one of ${WEATHERS.join('/')}, got "${weather}"`);
   }
+  const seeds = values.seeds ? Number(values.seeds) : 30;
+  // Leave a core for the OS and the main thread. Never more workers than
+  // seeds — an idle worker still pays full route-parse startup.
+  const defaultJobs = Math.max(1, Math.min(seeds, availableParallelism() - 1));
+  const jobs = values.jobs ? Math.max(1, Math.min(seeds, Number(values.jobs))) : defaultJobs;
   return {
     route: values.route ?? 'sorocaba-campos',
-    seeds: values.seeds ? Number(values.seeds) : 30,
+    seeds,
     globalCap: values.globalCap ? values.globalCap !== 'false' : true,
     weather: weather as Weather,
+    jobs,
+    // Mirrors the app's shipped default so the validation protocol measures
+    // the race format players actually get, not a mass start nothing uses.
+    startIntervalS: values.startInterval !== undefined ? Number(values.startInterval) : START_INTERVAL_S,
+    cars: values.cars ?? 'grid',
   };
+}
+
+/**
+ * Which cars race. The roster is ~200 strong now, and racing all of it per
+ * seed is both far slower (cross-car reads are O(n²) per step) and less
+ * meaningful — a field spanning a Fiat Uno to a Bugatti Bolide measures
+ * nothing about racing. So the default matches what the app actually runs:
+ * one fair, capped grid.
+ *
+ *   --cars grid          (default) a competitive MAX_FIELD_SIZE-car field
+ *   --cars all           the entire roster, the pre-expansion behaviour
+ *   --cars <tier>        a fair grid drawn from one performance tier
+ *                        (economy/everyday/sport/performance/super/hyper)
+ *   --cars id1,id2,...   exactly these car ids
+ */
+function resolveField(specs: CarSpec[], cars: string): CarSpec[] {
+  if (cars === 'all') return specs;
+  if (cars === 'grid') return buildFairField(specs, MAX_FIELD_SIZE);
+  const tier = PERFORMANCE_TIERS.find((t) => t.id === cars);
+  if (tier) {
+    const pool = specs.filter((s) => tierOf(s).id === tier.id);
+    if (pool.length === 0) throw new Error(`No cars in tier "${cars}"`);
+    return buildFairField(pool, MAX_FIELD_SIZE);
+  }
+  const ids = cars.split(',').map((s) => s.trim());
+  const picked = ids.map((id) => {
+    const spec = specs.find((s) => s.id === id);
+    if (!spec) throw new Error(`Unknown car id "${id}" in --cars`);
+    return spec;
+  });
+  return picked;
 }
 
 // Node-only route load (not src/route.ts's loadRoute — that fetches).
@@ -76,11 +144,20 @@ interface RaceResult {
 // friction-circle utilisation at a reasonably fine (1 Hz) grain — the sim's
 // own fixed-DT accumulator still steps physics at 1/60 s underneath.
 const SAMPLE_DT_S = 1;
-const MAX_SIM_SECONDS = 6 * 3600; // safety valve — no route here takes anywhere near 6h
+// Safety valve. Generous enough to cover an interval start's tail: the last
+// car is released (N-1) x interval into the race and then still has to run it.
+const MAX_SIM_SECONDS = 12 * 3600;
 
-function runRace(route: Route, specs: CarSpec[], seed: number, globalCapEnabled: boolean, weather: Weather): RaceResult {
+function runRace(
+  route: Route,
+  specs: CarSpec[],
+  seed: number,
+  globalCapEnabled: boolean,
+  weather: Weather,
+  startIntervalS: number,
+): RaceResult {
   const assignments: CarAssignment[] = specs.map((spec) => ({ spec, route }));
-  const sim = createSim(assignments, seed, globalCapEnabled, weather);
+  const sim = createSim(assignments, seed, globalCapEnabled, weather, startIntervalS);
 
   const peakU = new Map<string, number>(specs.map((s) => [s.id, 0]));
   let nanOrInfinite = false;
@@ -144,20 +221,69 @@ function runRace(route: Route, specs: CarSpec[], seed: number, globalCapEnabled:
   };
 }
 
-function main(): void {
+/** Runs `seeds` in this thread. Used by every worker, and by the main thread
+ * when --jobs 1 (worker startup isn't worth it for a single shard, and an
+ * inline run keeps stack traces readable while debugging the sim). */
+function runSeeds(input: WorkerInput): SeededResult[] {
+  const route = loadRouteSync(input.route);
+  const specs = resolveField(loadCarsSync(), input.cars);
+  return input.seeds.map((seed) => ({
+    seed,
+    result: runRace(route, specs, seed, input.globalCap, input.weather, input.startIntervalS),
+  }));
+}
+
+/** Round-robin rather than contiguous blocks: race cost varies with how early
+ * cars retire, so interleaving keeps the shards evenly sized in wall-clock
+ * terms even when one stretch of seeds happens to run long. */
+function shardSeeds(total: number, jobs: number): number[][] {
+  const shards: number[][] = Array.from({ length: jobs }, () => []);
+  for (let seed = 1; seed <= total; seed++) shards[(seed - 1) % jobs]!.push(seed);
+  return shards.filter((s) => s.length > 0);
+}
+
+function runShardInWorker(input: WorkerInput): Promise<SeededResult[]> {
+  return new Promise((resolve, reject) => {
+    // `new URL(import.meta.url)` re-enters *this* file in the worker, where
+    // the isMainThread guard at the bottom routes to runSeeds instead of
+    // main. tsx's loader is inherited by workers, so no build step is needed.
+    const worker = new Worker(new URL(import.meta.url), { workerData: input });
+    worker.once('message', resolve);
+    worker.once('error', reject);
+    worker.once('exit', (code) => {
+      if (code !== 0) reject(new Error(`sim-batch worker exited with code ${code}`));
+    });
+  });
+}
+
+async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const route = loadRouteSync(args.route);
-  const specs = loadCarsSync();
+  const specs = resolveField(loadCarsSync(), args.cars);
 
   console.log(
     `sim-batch: route=${args.route} (${(route.totalDistance / 1000).toFixed(1)} km), ` +
-      `cars=${specs.length}, seeds=${args.seeds}, globalCap=${args.globalCap}, weather=${args.weather}`,
+      `cars=${specs.length} (--cars ${args.cars}), seeds=${args.seeds}, globalCap=${args.globalCap}, weather=${args.weather}, ` +
+      `jobs=${args.jobs}, startInterval=${args.startIntervalS}s`,
   );
 
-  const results: RaceResult[] = [];
-  for (let seed = 1; seed <= args.seeds; seed++) {
-    results.push(runRace(route, specs, seed, args.globalCap, args.weather));
-  }
+  const startedAt = Date.now();
+  const shards = shardSeeds(args.seeds, args.jobs);
+  const base = {
+    route: args.route,
+    globalCap: args.globalCap,
+    weather: args.weather,
+    startIntervalS: args.startIntervalS,
+    cars: args.cars,
+  };
+  const seeded =
+    args.jobs === 1
+      ? shards.flatMap((seeds) => runSeeds({ ...base, seeds }))
+      : (await Promise.all(shards.map((seeds) => runShardInWorker({ ...base, seeds })))).flat();
+
+  seeded.sort((a, b) => a.seed - b.seed);
+  const results: RaceResult[] = seeded.map((s) => s.result);
+  console.log(`Ran ${results.length} races in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
 
   const totalCarRaces = args.seeds * specs.length;
   const totalBySeverity: Record<string, number> = {};
@@ -239,4 +365,11 @@ function main(): void {
   }
 }
 
-main();
+if (isMainThread) {
+  main().catch((err: unknown) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else {
+  parentPort!.postMessage(runSeeds(workerData as WorkerInput));
+}

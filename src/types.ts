@@ -27,6 +27,24 @@ export interface Route {
   totalDistance: number;                 // metres
   spacing: number;                       // 25
   points: RoutePoint[];
+  /**
+   * Full-resolution road geometry as [lon, lat] pairs — RENDERING ONLY.
+   *
+   * `points` is resampled onto a uniform 25 m grid (§5.3), which discards
+   * every vertex in between; a junction turn whose arc is shorter than 25 m
+   * collapses to a chord, so the drawn line visibly cuts the corner. This is
+   * the routing engine's original shape, kept so the map can draw the road
+   * as it actually runs.
+   *
+   * Nothing in sim.ts/driver.ts/physics.ts may read this. The simulation's
+   * world is the 25 m grid and nothing else — drawing and physics must stay
+   * one simplification apart at most, and this field exists precisely so the
+   * *drawing* side can be better without moving the physics side.
+   *
+   * Optional: absent on every route baked before it existed (§0.5), in which
+   * case the renderer falls back to `points` and looks exactly as it did.
+   */
+  shape?: Array<[number, number]>;
 }
 
 /** §5.9: one entry in public/data/routes/index.json. Shared between the
@@ -47,9 +65,22 @@ export interface RouteIndexEntry {
   variantLabel: string; // e.g. "Route 1" — always present, even for a lone variant
 }
 
+/**
+ * What kind of vehicle this is. Motorcycles race the same one-dimensional
+ * `(s, v)` simulation as cars — this changes only the handful of places where
+ * two wheels genuinely behave differently from four (see `pitchLimitG`,
+ * `MOTORCYCLE_WEATHER_GRIP`, `MOTORCYCLE_SEVERITY_SHIFT`,
+ * `TIRE_WEAR_MOTORCYCLE_MULT`), never the shape of the model.
+ */
+export type VehicleType = 'car' | 'motorcycle';
+
 export interface CarSpec {
   id: string;
   name: string;
+  type: VehicleType;
+  make: string;         // manufacturer, e.g. "Toyota" — the roster's grouping
+                          // key in the config panel. Purely presentational:
+                          // nothing in the simulation reads it.
   colour: string;       // hex, for map icon + leaderboard
   mass: number;         // kg, including driver
   power: number;        // W, peak at the wheels
@@ -61,6 +92,19 @@ export interface CarSpec {
   aggression: number;    // 0.90–1.10 multiplier on the cornering speed profile.
                           // >1.00 means the driver targets speeds above the
                           // car's actual grip limit and can therefore crash.
+                          // Cornering ONLY — see limitTolerance for the
+                          // separate "how far over a posted limit" trait.
+  limitTolerance: number; // 0.95–1.10, R10: how far over a posted speed limit
+                          // (or the GLOBAL_CAP stand-in) this driver runs.
+                          // Deliberately NOT `aggression`: the two were one
+                          // field, which made cornering bravery also decide
+                          // straight-line pace. On a route that is ~90%
+                          // limit-tagged that single number swamped power,
+                          // mass, drag and grip together — a 1.06-aggression
+                          // Civic Type R beat every hypercar and the
+                          // 0.88-aggression U9 Xtreme finished last, behind a
+                          // Ford F-150 (measured over 15 seeds). A driver
+                          // trait, like aggression — not a car spec.
   errorSigma: number;    // 0.00–0.06, magnitude of slow-varying misjudgement
                           // in the driver's speed estimate. See §7.4.
   lineQuality: number;   // 1.00–1.15, R3: how much a driver straightens a
@@ -77,9 +121,32 @@ export interface CarSpec {
                           // (force = P/v) — a per-gear approximation, not a
                           // real spec. Default 5 reproduces the pre-R14
                           // hardcoded floor exactly.
+  /**
+   * M1 — the defining two-wheel constraint: the longitudinal acceleration, in
+   * g, at which the vehicle pitches over rather than gripping harder. A
+   * motorcycle accelerating hard lifts its front wheel and braking hard lifts
+   * its rear, and both happen *below* the tyres' friction limit, so a
+   * 200 hp/200 kg superbike cannot use anything like its power at low speed
+   * and cannot out-brake a good car despite superb tyres.
+   *
+   * One number is used for both directions, set to the tighter of the two
+   * (braking, on most sportbikes) — the sim is longitudinal-only and a second
+   * field would imply a precision this model does not have.
+   *
+   * `Infinity` for cars: four contact patches, a low centre of gravity and no
+   * pitch-over mode, so traction is the only limit and this drops out of the
+   * force balance entirely (Math.min with Infinity is exact — car races are
+   * bit-identical to before this field existed).
+   */
+  pitchLimitG: number;
 }
 
-export type CarStatus = 'racing' | 'spinning' | 'retired' | 'finished';
+/** `staged` = released into the race but not yet under way, i.e. waiting out
+ * its interval-start delay at the line. Deliberately its own status rather
+ * than a `racing` car that happens to sit at v=0: every cross-car rule
+ * (drafting, blocking, hazards) must ignore a car that is not on the road
+ * yet, and those rules are all expressed as status sets. */
+export type CarStatus = 'staged' | 'racing' | 'spinning' | 'retired' | 'finished';
 
 /** R7: one race-level condition, fixed for the whole race — dynamic weather
  * (changing mid-race) is a later feature; the event-log architecture
@@ -97,11 +164,27 @@ export interface CarState {
   recoveryRemaining: number;  // simulated seconds left immobilised after a spin,
                                // or throttle-locked-out after a slide — see §7.5
   incidents: Incident[];
-  finishTime: number | null;  // simulated seconds
+  /** Interval start: simulated seconds after the race clock starts before this
+   * car is released. 0 for a mass start. Fixed at createSim, never mutated. */
+  startDelay: number;
+  /** Simulated seconds of THIS CAR'S OWN running time (i.e. clock at the line
+   * to clock at the flag), not absolute race time — under an interval start
+   * the two differ by `startDelay`, and only own-running-time is comparable
+   * between cars. Null until the car finishes. */
+  finishTime: number | null;
   speedProfile: Float32Array; // per-car, precomputed — see §7
   rng: () => number;          // seeded PRNG, one per car — see §7.5
   seed: number;                // fixed numeric seed for the pure valueNoise() misjudgement
                                 // function, distinct from rng's stateful stream — see §7.4
+  /** R5: seconds this car has spent stuck behind a slower car it cannot
+   * simply drive around. Resets the moment it is no longer held up. Drives
+   * the decision to commit to a pass — see PASS_PATIENCE_S. */
+  heldUpFor: number;
+  /** R5: seconds remaining in a committed overtake. While > 0 the car is not
+   * held back by the car ahead, and is cornering off the good line (see
+   * PASS_LINE_PENALTY) — which the ordinary friction-circle check then
+   * punishes if the pass was committed somewhere stupid. 0 = not passing. */
+  passRemaining: number;
   tireWear: number;            // R11: 0 (fresh) to 1 (fully worn), accumulates with distance/load
   condition: {                  // R11/R12: shared "effective condition" multipliers, both start at 1.
     grip: number;                // R12: permanently reduced a little by each slide/spin, floored at 0.9
@@ -150,4 +233,13 @@ export interface FinishEvent {
   carId: string;
 }
 
-export type RaceEvent = IncidentEvent | OvertakeEvent | FinishEvent;
+/** Pushed the step a car is released from the line under an interval start.
+ * `time` is the absolute race clock, so a summary can reconstruct each car's
+ * own running clock without needing its startDelay. */
+export interface StartEvent {
+  time: number;
+  type: 'start';
+  carId: string;
+}
+
+export type RaceEvent = IncidentEvent | OvertakeEvent | FinishEvent | StartEvent;

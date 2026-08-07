@@ -10,6 +10,7 @@ import {
   buildRoadIndex,
   nearestRoad,
   decodePolyline6,
+  simplifyIndices,
 } from './bakeRoute';
 
 /** Reference encoder for the round-trip test below — the inverse of
@@ -247,5 +248,66 @@ describe('minFilter (forward-looking)', () => {
     expect(out[10]).toBe(10);
     expect(out[7]).toBe(10); // within lookahead before the tight point
     expect(out[11]).toBe(1000); // just after — no backward smearing
+  });
+});
+
+describe('simplifyIndices (render-shape Douglas-Peucker)', () => {
+  it('keeps only the endpoints of a straight line', () => {
+    const pts = Array.from({ length: 50 }, (_, i) => ({ x: i * 10, y: 0 }));
+    expect(simplifyIndices(pts, 0.5)).toEqual([0, 49]);
+  });
+
+  it('keeps a vertex that deviates by more than the tolerance', () => {
+    const pts = [
+      { x: 0, y: 0 },
+      { x: 10, y: 5 }, // 5 m off the straight line — well past tolerance
+      { x: 20, y: 0 },
+    ];
+    expect(simplifyIndices(pts, 0.5)).toEqual([0, 1, 2]);
+  });
+
+  it('drops a vertex that deviates by less than the tolerance', () => {
+    const pts = [
+      { x: 0, y: 0 },
+      { x: 10, y: 0.2 }, // 0.2 m — invisible at any zoom the game uses
+      { x: 20, y: 0 },
+    ];
+    expect(simplifyIndices(pts, 0.5)).toEqual([0, 2]);
+  });
+
+  it('preserves corner shape: a right-angle turn survives simplification', () => {
+    // 25 straight, one 90° corner, 25 straight — the exact case Route.shape
+    // exists to draw correctly.
+    const pts = [
+      ...Array.from({ length: 25 }, (_, i) => ({ x: i * 4, y: 0 })),
+      ...Array.from({ length: 25 }, (_, i) => ({ x: 96, y: (i + 1) * 4 })),
+    ];
+    const kept = simplifyIndices(pts, 0.5);
+    // The corner vertex must be among those kept, or the turn becomes a chord.
+    expect(kept).toContain(24);
+    expect(kept.length).toBeLessThan(pts.length); // collinear runs still collapse
+  });
+
+  it('returns every index for degenerate inputs', () => {
+    expect(simplifyIndices([], 0.5)).toEqual([]);
+    expect(simplifyIndices([{ x: 0, y: 0 }], 0.5)).toEqual([0]);
+    expect(simplifyIndices([{ x: 0, y: 0 }, { x: 1, y: 1 }], 0.5)).toEqual([0, 1]);
+  });
+
+  it('survives a duplicated vertex (zero-length segment)', () => {
+    const pts = [
+      { x: 0, y: 0 },
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+    ];
+    expect(() => simplifyIndices(pts, 0.5)).not.toThrow();
+  });
+
+  it('is monotonic in index order', () => {
+    const pts = Array.from({ length: 200 }, (_, i) => ({ x: i, y: Math.sin(i / 5) * 10 }));
+    const kept = simplifyIndices(pts, 0.5);
+    for (let i = 1; i < kept.length; i++) expect(kept[i]!).toBeGreaterThan(kept[i - 1]!);
+    expect(kept[0]).toBe(0);
+    expect(kept[kept.length - 1]).toBe(199);
   });
 });

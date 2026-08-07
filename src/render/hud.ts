@@ -1,9 +1,17 @@
 import type { CarState, Incident } from '../types';
 import type { RouteSample } from '../route';
-import { resolveLeader, remainingDistance } from '../sim';
+import { resolveLeader, remainingDistance, raceRank } from '../sim';
 import { formatDistance, formatElapsed, carDot } from '../format';
 
 const MAX_INCIDENT_FEED_ROWS = 20;
+
+/** Assigning textContent replaces the text node even when the string is
+ * unchanged, so a settled leaderboard (staged cars, a finished race) would
+ * still churn ~8 cells × N rows of DOM on every HUD tick. Most cells hold the
+ * same string tick to tick; comparing first is far cheaper than rewriting. */
+function setText(el: HTMLElement, text: string): void {
+  if (el.textContent !== text) el.textContent = text;
+}
 
 function severityLabel(severity: Incident['severity']): string {
   switch (severity) {
@@ -33,13 +41,15 @@ export interface HudCallbacks {
 }
 
 export interface HudInstance {
-  render(cars: CarState[], camera: CameraState, samples: Map<string, RouteSample>): void;
+  render(cars: CarState[], camera: CameraState, samples: Map<string, RouteSample>, simTime: number): void;
   /** Called from sim.onIncident (wired in main.ts) — see B10/R5. */
   pushIncident(car: CarState, incident: Incident): void;
 }
 
-function formatStatus(car: CarState): string {
+function formatStatus(car: CarState, simTime: number): string {
   switch (car.status) {
+    case 'staged':
+      return `Starts in ${Math.max(0, car.startDelay - simTime).toFixed(0)}s`;
     case 'spinning':
       return `Spinning (${car.recoveryRemaining.toFixed(0)}s)`;
     case 'retired':
@@ -72,6 +82,10 @@ interface HudDom {
   finishedIds: Set<string>;
   incidentFeed: HTMLElement;
   incidentList: HTMLOListElement;
+  telemetry: HTMLElement;
+  telemetryCar: HTMLElement;
+  telemetryBars: Map<string, HTMLElement>;
+  telemetryValues: Map<string, HTMLElement>;
 }
 
 /**
@@ -130,7 +144,7 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
             <th>Pos</th>
             <th>Car</th>
             <th>Speed</th>
-            <th>Gap</th>
+            <th title="Road distance still to run compared with the leader. Negative means this car is ahead on the road but behind on time — cars start at intervals and are classified on their own elapsed time.">Gap</th>
             <th>Traveled</th>
             <th>Remaining</th>
             <th>Elevation</th>
@@ -147,6 +161,33 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
     <div class="incident-feed" hidden>
       <h4>Incidents</h4>
       <ol></ol>
+    </div>
+    <!-- Telemetry (R11/R12): throttle, brake, tyre wear and accumulated damage
+         are all simulated per step and were, until this existed, invisible —
+         CarState.throttle/brake are even typed "for HUD/telemetry". Shown for
+         the followed car only; there is nothing useful about 28 cars' worth of
+         bars at once. -->
+    <div class="telemetry" hidden>
+      <h4>Telemetry — <span class="telemetry-car"></span></h4>
+      <div class="telemetry-row">
+        <span class="telemetry-label">Throttle</span>
+        <span class="telemetry-bar"><i data-bar="throttle"></i></span>
+        <span class="telemetry-value" data-value="throttle"></span>
+      </div>
+      <div class="telemetry-row">
+        <span class="telemetry-label">Brake</span>
+        <span class="telemetry-bar"><i data-bar="brake"></i></span>
+        <span class="telemetry-value" data-value="brake"></span>
+      </div>
+      <div class="telemetry-row">
+        <span class="telemetry-label">Tyres</span>
+        <span class="telemetry-bar"><i data-bar="tire"></i></span>
+        <span class="telemetry-value" data-value="tire"></span>
+      </div>
+      <div class="telemetry-row telemetry-condition">
+        <span class="telemetry-label">Condition</span>
+        <span class="telemetry-value" data-value="condition"></span>
+      </div>
     </div>`;
 
     const cameraButtons = new Map<string, HTMLButtonElement>();
@@ -187,10 +228,23 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
       finishedIds: new Set(),
       incidentFeed: container.querySelector('.incident-feed')!,
       incidentList: container.querySelector('.incident-feed ol')!,
+      telemetry: container.querySelector('.telemetry')!,
+      telemetryCar: container.querySelector('.telemetry-car')!,
+      telemetryBars: new Map(
+        [...container.querySelectorAll<HTMLElement>('.telemetry [data-bar]')].map((el) => [el.dataset.bar!, el]),
+      ),
+      telemetryValues: new Map(
+        [...container.querySelectorAll<HTMLElement>('.telemetry [data-value]')].map((el) => [el.dataset.value!, el]),
+      ),
     };
   }
 
-  function render(cars: CarState[], camera: CameraState, samples: Map<string, RouteSample>): void {
+  function render(
+    cars: CarState[],
+    camera: CameraState,
+    samples: Map<string, RouteSample>,
+    simTime: number,
+  ): void {
     if (!dom || dom.carsRef !== cars) {
       dom = buildDom(cars);
     }
@@ -202,13 +256,13 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
       .classList.toggle('active', camera.mode === 'follow' && camera.target === 'leader');
     d.cameraButtons.get('free')!.classList.toggle('active', camera.mode === 'free');
 
-    // F1: `s` isn't comparable across cars on different routes — rank and
-    // gap by remaining distance instead (see sim.ts's remainingDistance).
-    // A retired car still shows where it got to (position column), but
-    // "leader" for the Gap column baseline and the Follow-Leader highlight
-    // excludes retired cars — see sim.ts's resolveLeader.
-    const sorted = [...cars].sort((a, b) => remainingDistance(a) - remainingDistance(b));
-    const leader = cars.length > 0 ? resolveLeader(cars) : null;
+    // Rank by projected own-running-time, not road position: under an
+    // interval start the car physically furthest down the road may simply
+    // have left the line first (see sim.ts's projectedTime). A retired car
+    // still shows where it got to, but "leader" for the Gap baseline and the
+    // Follow-Leader highlight excludes retired cars — see resolveLeader.
+    const sorted = raceRank(cars, simTime);
+    const leader = cars.length > 0 ? resolveLeader(cars, simTime) : null;
     const leaderRemaining = leader ? remainingDistance(leader) : 0;
     const leaderId = leader?.spec.id ?? null;
     const isSelected = (carId: string) =>
@@ -217,16 +271,24 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
     sorted.forEach((car, i) => {
       const row = d.rows.get(car.spec.id)!;
       const { ele } = samples.get(car.spec.id)!;
-      const gap = remainingDistance(car) - leaderRemaining;
       const remaining = remainingDistance(car);
+      // Gap is road distance to the leader: how much further this car still
+      // has to go than the leader does. Signed, because rows are ordered by
+      // projected time rather than road position — under an interval start a
+      // car that left the line earlier can be physically up the road while
+      // ranked below, and that shows here as a negative gap. Measuring the
+      // difference in *remaining* distance (rather than in `s`) keeps it
+      // meaningful when cars are on different route variants of the same
+      // course, whose total lengths differ (F1).
+      const gap = remaining - leaderRemaining;
 
-      row.pos.textContent = String(i + 1);
-      row.speed.textContent = `${(car.v * 3.6).toFixed(0)} km/h`;
-      row.gap.textContent = car.spec.id === leaderId ? '—' : formatDistance(gap);
-      row.traveled.textContent = formatDistance(car.s);
-      row.remaining.textContent = formatDistance(remaining);
-      row.elevation.textContent = `${ele.toFixed(0)} m`;
-      row.status.textContent = formatStatus(car);
+      setText(row.pos, String(i + 1));
+      setText(row.speed, `${(car.v * 3.6).toFixed(0)} km/h`);
+      setText(row.gap, car.spec.id === leaderId ? '—' : `${gap < 0 ? '−' : '+'}${formatDistance(Math.abs(gap))}`);
+      setText(row.traveled, formatDistance(car.s));
+      setText(row.remaining, formatDistance(remaining));
+      setText(row.elevation, `${ele.toFixed(0)} m`);
+      setText(row.status, formatStatus(car, simTime));
       row.tr.classList.toggle('selected', isSelected(car.spec.id));
 
       // appendChild on a node that's *already* the last child still removes
@@ -239,36 +301,69 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
       }
     });
 
-    const newlyFinished = cars
+    const finishers = cars
       .filter((c): c is CarState & { finishTime: number } => c.status === 'finished' && c.finishTime !== null)
-      .filter((c) => !d.finishedIds.has(c.spec.id))
       .sort((a, b) => a.finishTime - b.finishTime);
 
-    for (const car of newlyFinished) {
-      d.finishedIds.add(car.spec.id);
+    // Rebuilt whole rather than appended to. Under an interval start, cars
+    // cross the line in road order but are classified on their OWN elapsed
+    // time, so a car finishing later in absolute terms can still take the
+    // win — an append-only list would freeze the first arrival at "1." and
+    // never correct it. Only rebuilt when the finisher set actually grows,
+    // so a settled board still costs nothing per frame.
+    if (finishers.length !== d.finishedIds.size) {
+      d.finishedIds = new Set(finishers.map((c) => c.spec.id));
+      d.finishList.replaceChildren();
 
-      const rank = document.createElement('span');
-      rank.className = 'finish-rank';
-      rank.textContent = `${d.finishedIds.size}.`;
+      finishers.forEach((car, i) => {
+        const rank = document.createElement('span');
+        rank.className = 'finish-rank';
+        rank.textContent = `${i + 1}.`;
 
-      const name = document.createElement('span');
-      name.className = 'finish-name';
-      name.textContent = car.spec.name;
+        const name = document.createElement('span');
+        name.className = 'finish-name';
+        name.textContent = car.spec.name;
 
-      const time = document.createElement('span');
-      time.className = 'finish-time';
-      time.textContent = formatElapsed(car.finishTime);
+        const time = document.createElement('span');
+        time.className = 'finish-time';
+        time.textContent = formatElapsed(car.finishTime);
 
-      // Whole-route average — each car's OWN route (F1: routes differ per
-      // car), so averages stay honest when the field is split across variants.
-      const avg = document.createElement('span');
-      avg.className = 'finish-avg';
-      avg.textContent = `${Math.round((car.route.totalDistance / car.finishTime) * 3.6)} km/h avg`;
+        // Whole-route average — each car's OWN route (F1: routes differ per
+        // car), so averages stay honest when the field is split across variants.
+        const avg = document.createElement('span');
+        avg.className = 'finish-avg';
+        avg.textContent = `${Math.round((car.route.totalDistance / car.finishTime) * 3.6)} km/h avg`;
 
-      const li = document.createElement('li');
-      li.append(rank, carDot(car.spec.colour), name, time, avg);
-      d.finishList.appendChild(li);
-      d.finishBoard.hidden = false;
+        const li = document.createElement('li');
+        li.append(rank, carDot(car.spec.colour), name, time, avg);
+        d.finishList.appendChild(li);
+      });
+      d.finishBoard.hidden = finishers.length === 0;
+    }
+
+    // Telemetry for whoever the camera is on; hidden entirely in overview or
+    // free mode, where "the selected car" is not a thing.
+    const focus = camera.mode === 'follow' ? sorted.find((c) => isSelected(c.spec.id)) : undefined;
+    d.telemetry.hidden = focus === undefined;
+    if (focus) {
+      setText(d.telemetryCar, focus.spec.name);
+      const setBar = (key: string, fraction: number, text: string) => {
+        const bar = d.telemetryBars.get(key)!;
+        const width = `${Math.round(Math.min(1, Math.max(0, fraction)) * 100)}%`;
+        if (bar.style.width !== width) bar.style.width = width;
+        setText(d.telemetryValues.get(key)!, text);
+      };
+      setBar('throttle', focus.throttle, `${Math.round(focus.throttle * 100)}%`);
+      setBar('brake', focus.brake, `${Math.round(focus.brake * 100)}%`);
+      setBar('tire', focus.tireWear, `${Math.round(focus.tireWear * 100)}% worn`);
+      // R12 damage is permanent and small by design, so it reads better as an
+      // explicit "none" than as a bar pinned near full.
+      const gripLoss = Math.round((1 - focus.condition.grip) * 1000) / 10;
+      const dragGain = Math.round((focus.condition.cdA - 1) * 1000) / 10;
+      setText(
+        d.telemetryValues.get('condition')!,
+        gripLoss === 0 && dragGain === 0 ? 'undamaged' : `-${gripLoss}% grip, +${dragGain}% drag`,
+      );
     }
 
     for (const { car, incident } of pendingIncidents) {

@@ -1,6 +1,24 @@
 import { describe, it, expect } from 'vitest';
-import { interpolateAt, radiusAt, surfaceAt, assertRoute, RouteValidationError } from './route';
+import {
+  interpolateAt,
+  radiusAt,
+  surfaceAt,
+  headingAt,
+  assertRoute,
+  RouteValidationError,
+  CAR_HEADING_WINDOW_M,
+  CAMERA_HEADING_WINDOW_M,
+} from './route';
 import { makeTestRoute } from './test-fixtures';
+
+/** makeTestRoute runs due east along the equator; these cover other headings. */
+function makeOrientedRoute(dLon: number, dLat: number, n = 40) {
+  const base = makeTestRoute({ n });
+  return {
+    ...base,
+    points: base.points.map((p, i) => ({ ...p, lon: i * dLon, lat: i * dLat })),
+  };
+}
 
 describe('interpolateAt', () => {
   it('linearly interpolates lon/lat/ele/grade between neighbouring points', () => {
@@ -125,5 +143,136 @@ describe('assertRoute (R7)', () => {
     const route = makeTestRoute({ n: 10 });
     expect(() => assertRoute({ ...route, spacing: 0 }, 'test')).toThrow(RouteValidationError);
     expect(() => assertRoute({ ...route, totalDistance: 0 }, 'test')).toThrow(RouteValidationError);
+  });
+
+  // Validation used to sample only the first, middle and last points, so a
+  // corrupt interior point loaded cleanly and then propagated NaN through the
+  // speed profile into every car — no error, no obvious symptom.
+  it('rejects a non-finite field at an interior index, not just the sampled ones', () => {
+    for (const field of ['radius', 'grade', 'ele', 'lon', 'lat'] as const) {
+      const route = makeTestRoute({ n: 101 });
+      route.points[37]![field] = NaN;
+      expect(() => assertRoute(route, 'test')).toThrow(new RegExp(`non-finite ${field} at index 37`));
+    }
+  });
+
+  it('rejects a non-finite optional surface/limit at an interior index', () => {
+    const withSurface = makeTestRoute({ n: 101, surfaceAt: () => 1 });
+    withSurface.points[42]!.surface = NaN;
+    expect(() => assertRoute(withSurface, 'test')).toThrow(/non-finite surface at index 42/);
+
+    const withLimit = makeTestRoute({ n: 101, limitAt: () => 25 });
+    withLimit.points[42]!.limit = Infinity;
+    expect(() => assertRoute(withLimit, 'test')).toThrow(/non-finite limit at index 42/);
+  });
+
+  it('rejects a bad shape coordinate at an interior index', () => {
+    const route = makeTestRoute({ n: 10 });
+    const shape: Array<[number, number]> = Array.from({ length: 101 }, (_, i) => [i / 1000, 0]);
+    shape[57] = [0.057, NaN];
+    expect(() => assertRoute({ ...route, shape }, 'test')).toThrow(/shape\[57\]/);
+  });
+});
+
+describe('headingAt', () => {
+  it('reads due east on the eastward test route', () => {
+    const route = makeTestRoute({ n: 40 });
+    expect(headingAt(route, 200)).toBeCloseTo(90, 4);
+  });
+
+  it('reads the cardinal directions', () => {
+    expect(headingAt(makeOrientedRoute(0, 0.001), 200)).toBeCloseTo(0, 4); // north
+    expect(headingAt(makeOrientedRoute(0, -0.001), 200)).toBeCloseTo(180, 4); // south
+    expect(headingAt(makeOrientedRoute(-0.001, 0), 200)).toBeCloseTo(-90, 4); // west
+    expect(headingAt(makeOrientedRoute(0.001, 0.001), 200)).toBeCloseTo(45, 1); // north-east
+  });
+
+  it('stays on-heading at the finish instead of collapsing to due north', () => {
+    // The lookahead window would otherwise clamp both samples onto the final
+    // point, leaving atan2(0, 0) to pin the camera north on every finish.
+    const route = makeTestRoute({ n: 40 });
+    expect(headingAt(route, route.totalDistance)).toBeCloseTo(90, 4);
+  });
+
+  it('stays finite past both ends of the route', () => {
+    const route = makeTestRoute({ n: 40 });
+    expect(Number.isFinite(headingAt(route, -500))).toBe(true);
+    expect(Number.isFinite(headingAt(route, route.totalDistance + 500))).toBe(true);
+  });
+
+  it('handles a route shorter than the lookahead window', () => {
+    const route = makeTestRoute({ n: 2 }); // 25 m total, vs a 75 m window
+    expect(headingAt(route, 0)).toBeCloseTo(90, 4);
+  });
+});
+
+describe('Route.shape (render-only full-resolution geometry)', () => {
+  it('accepts a route with no shape at all (pre-existing bakes)', () => {
+    const route = makeTestRoute({ n: 10 });
+    expect(route.shape).toBeUndefined();
+    expect(() => assertRoute(route, 'test')).not.toThrow();
+  });
+
+  it('accepts a well-formed shape', () => {
+    const route = { ...makeTestRoute({ n: 10 }), shape: [[0, 0], [0.1, 0.1]] };
+    expect(() => assertRoute(route, 'test')).not.toThrow();
+  });
+
+  it('rejects a malformed shape rather than letting it reach the renderer', () => {
+    const base = makeTestRoute({ n: 10 });
+    expect(() => assertRoute({ ...base, shape: [] }, 'test')).toThrow(/shape/);
+    expect(() => assertRoute({ ...base, shape: [[0, 0]] }, 'test')).toThrow(/shape/);
+    expect(() => assertRoute({ ...base, shape: [[0, 0], [NaN, 1]] }, 'test')).toThrow(/shape/);
+    expect(() => assertRoute({ ...base, shape: [[0, 0], [1]] }, 'test')).toThrow(/shape/);
+  });
+});
+
+describe('headingAt window is centred on the car (not forward-looking)', () => {
+  // L-shaped route: 200 m due east, then 200 m due north. The corner is at
+  // s = 200. Built at the equator so 25 m is a constant step in both axes.
+  function makeCornerRoute() {
+    const d = 25 / 111_320;
+    const base = makeTestRoute({ n: 17 });
+    const points = base.points.map((p, i) => {
+      if (i <= 8) return { ...p, lon: i * d, lat: 0 };
+      return { ...p, lon: 8 * d, lat: (i - 8) * d };
+    });
+    return { ...base, points };
+  }
+
+  const route = makeCornerRoute();
+
+  it('still points along the straight 50 m before the corner', () => {
+    // The regression this guards: a forward-only window (s .. s+75) reported
+    // the road's direction up to 75 m ahead, so a car at s=150 already read as
+    // part-way round a corner it had not reached — which looked like the car
+    // sliding sideways down the road.
+    expect(headingAt(route, 150, 30)).toBeCloseTo(90, 1); // due east
+    expect(headingAt(route, 150)).toBeCloseTo(90, 1); // camera window too
+  });
+
+  it('reads the corner only while on it', () => {
+    // Halfway through the turn the centred window straddles both legs.
+    expect(headingAt(route, 200, 30)).toBeCloseTo(45, 1);
+  });
+
+  it('has settled onto the new heading past the corner', () => {
+    expect(headingAt(route, 250, 30)).toBeCloseTo(0, 1); // due north
+  });
+
+  it('turns symmetrically about the corner', () => {
+    // Equal distances either side should sit equally far from the 45° apex —
+    // an off-centre window makes the approach and exit asymmetric.
+    const before = headingAt(route, 175, 30);
+    const after = headingAt(route, 225, 30);
+    expect(90 - before).toBeCloseTo(after - 0, 1);
+  });
+
+  it('turns over a shorter distance with the tighter car window', () => {
+    // The car window must commit to the corner later than the camera's, or the
+    // models lead the camera into the turn.
+    const carLead = 90 - headingAt(route, 180, CAR_HEADING_WINDOW_M);
+    const cameraLead = 90 - headingAt(route, 180, CAMERA_HEADING_WINDOW_M);
+    expect(carLead).toBeLessThan(cameraLead);
   });
 });

@@ -50,14 +50,22 @@ export function computeAcceleration({
   // see driver.ts's computeSpeedProfileUncached and driverControl.
   const muLongEff = muLong * gripMultiplier;
   const normalLoad = m * G * Math.cos(grade);
+  // M1: pitch-over ceiling — a motorcycle lifts a wheel before it slides one,
+  // in both directions (wheelie under power, stoppie under brakes). Note this
+  // is a force ceiling from *geometry*, so unlike the traction term it does
+  // not scale with gripMultiplier: a wet road does not make a bike wheelie at
+  // a lower acceleration, it just runs out of grip first instead. `Infinity`
+  // for cars, which makes both Math.min calls below exact no-ops.
+  const pitchCap = spec.pitchLimitG * m * G;
   // R14: constant torque (force = P/peakPowerSpeed) below peakPowerSpeed,
   // constant power (force = P/v) above it — a per-gear approximation.
   // peakPowerSpeed defaults to 5, reproducing the pre-R14 hardcoded floor.
-  const fTraction = throttle * Math.min(effectivePower / Math.max(v, peakPowerSpeed), muLongEff * normalLoad);
+  const fTraction =
+    throttle * Math.min(effectivePower / Math.max(v, peakPowerSpeed), muLongEff * normalLoad, pitchCap);
   const fDrag = 0.5 * rho * cdA * conditionCdA * v * v * dragFactor;
   const fRoll = crr * normalLoad;
   const fGrade = m * G * Math.sin(grade);
-  const fBrake = brake * muLongEff * normalLoad;
+  const fBrake = brake * Math.min(muLongEff * normalLoad, pitchCap);
 
   return {
     a: (fTraction - fBrake - fDrag - fRoll - fGrade) / m,

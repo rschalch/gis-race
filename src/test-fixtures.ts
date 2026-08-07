@@ -41,6 +41,8 @@ export function makeTestRoute({ n, radiusAt = () => 3000, gradeAt = () => 0, sur
 export const TEST_CAR: CarSpec = {
   id: 'test-car',
   name: 'Test Car',
+  type: 'car',
+  make: 'Test',
   colour: '#ffffff',
   mass: 1450,
   power: 200_000,
@@ -50,8 +52,10 @@ export const TEST_CAR: CarSpec = {
   muLat: 0.98,
   vMax: 275 / 3.6,
   aggression: 1.06,
+  limitTolerance: 1.0,
   errorSigma: 0.05,
   lineQuality: 1.05,
   induction: 'forced',
+  pitchLimitG: Infinity,
   peakPowerSpeed: 5,
 };

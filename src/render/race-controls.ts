@@ -1,4 +1,5 @@
 import { formatElapsed } from '../format';
+import { KEYBOARD_HELP } from './keyboard';
 
 export interface RaceState {
   simTime: number;
@@ -17,7 +18,7 @@ export interface RaceControlsInstance {
   render(race: RaceState): void;
 }
 
-const TIME_SCALES = [1, 2, 5, 10];
+export const TIME_SCALES = [1, 2, 5, 10];
 
 /**
  * Build once and wire the delegated click handler, returning an instance
@@ -33,7 +34,16 @@ export function initRaceControls(container: HTMLElement, callbacks: RaceControls
       ${TIME_SCALES.map((scale) => `<button data-time-scale="${scale}">${scale}×</button>`).join('')}
     </div>
     <button data-action="pause"></button>
-    <button data-action="reset">Reset</button>`;
+    <button data-action="reset">Reset</button>
+    <!-- Shortcuts are useless if nobody knows they exist; the list is built
+         from the same KEYBOARD_HELP the handler is documented by, so the two
+         cannot drift apart. -->
+    <div class="shortcut-hint" tabindex="0" aria-label="Keyboard shortcuts">
+      <span class="shortcut-hint-icon">⌨</span>
+      <div class="shortcut-list">
+        ${KEYBOARD_HELP.map((h) => `<div><kbd>${h.keys}</kbd><span>${h.description}</span></div>`).join('')}
+      </div>
+    </div>`;
 
   const timeScaleButtons = new Map<number, HTMLButtonElement>();
   container.querySelectorAll<HTMLButtonElement>('[data-time-scale]').forEach((btn) => {
@@ -57,20 +67,34 @@ export function initRaceControls(container: HTMLElement, callbacks: RaceControls
     }
   });
 
+  // This runs every animation frame, and assigning textContent replaces the
+  // element's text node even when the string is identical — 60 pointless DOM
+  // mutations a second, each one dirtying layout while the map may be mid-drag.
+  let lastElapsed = '';
+  let lastPauseLabel = '';
+
   return {
     render(race: RaceState): void {
-      elapsed.textContent = formatElapsed(race.simTime);
+      const elapsedText = formatElapsed(race.simTime);
+      if (elapsedText !== lastElapsed) {
+        elapsed.textContent = elapsedText;
+        lastElapsed = elapsedText;
+      }
       for (const [scale, btn] of timeScaleButtons) {
         btn.classList.toggle('active', race.timeScale === scale);
       }
       pauseButton.disabled = race.raceOver;
-      pauseButton.textContent = race.raceOver
+      const pauseLabel = race.raceOver
         ? 'Race Over'
         : race.paused
           ? race.simTime === 0
             ? 'Start'
             : 'Resume'
           : 'Stop';
+      if (pauseLabel !== lastPauseLabel) {
+        pauseButton.textContent = pauseLabel;
+        lastPauseLabel = pauseLabel;
+      }
     },
   };
 }

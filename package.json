@@ -10,13 +10,22 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "backfill-shapes": "tsx tools/backfill-shapes.ts"
   },
   "dependencies": {
-    "maplibre-gl": "^4.7.1"
+    "@deck.gl/core": "^9.3.7",
+    "@deck.gl/mapbox": "^9.3.7",
+    "@deck.gl/mesh-layers": "^9.3.7",
+    "@luma.gl/core": "^9.3.6",
+    "@math.gl/web-mercator": "^4.1.0",
+    "maplibre-gl": "^5.24.0"
   },
   "devDependencies": {
+    "@types/geojson": "^7946.0.16",
     "@types/node": "^26.1.1",
+    "@types/pngjs": "^6.0.5",
+    "pngjs": "^7.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3",
     "vite": "^5.4.11",

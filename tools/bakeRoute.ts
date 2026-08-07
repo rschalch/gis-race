@@ -96,7 +96,7 @@ async function geocode(query: string): Promise<[number, number]> {
 
 export const MAX_ALTERNATIVES = 3; // bounds worst-case bake time — each variant repeats the full elevation fetch
 
-interface GeometryCandidate {
+export interface GeometryCandidate {
   coords: [number, number][];
   distanceM: number;
 }
@@ -201,7 +201,7 @@ async function fetchOsrmGeometries(
 // server is the fallback when Valhalla is down or errors — same resilience
 // posture as the Overpass pass (degrade, don't fail the bake), except a
 // routing failure on BOTH engines is fatal (there's nothing to bake).
-async function fetchRouteGeometries(
+export async function fetchRouteGeometries(
   from: [number, number],
   to: [number, number],
   alternatives: boolean,
@@ -246,7 +246,7 @@ async function fetchRouteGeometries(
 // --- §5.2: project to local ENU metres ---
 const R_EARTH = 6378137;
 
-function makeProjection(lon0: number, lat0: number) {
+export function makeProjection(lon0: number, lat0: number) {
   const cosLat0 = Math.cos((lat0 * Math.PI) / 180);
   return {
     project(lon: number, lat: number): { x: number; y: number } {
@@ -301,6 +301,75 @@ export function resample(
   // spacing, so this doesn't need special-casing downstream.
   if (n * spacing < total) result.push(sampleAt(total));
   return result;
+}
+
+// --- render-only full-resolution shape (see Route.shape) ---
+
+/**
+ * Douglas-Peucker tolerance, in metres, for the render shape stored alongside
+ * the 25 m grid.
+ *
+ * Storing the routing engine's raw polyline verbatim would roughly double
+ * every route file (they are already 0.5-1.5 MB and committed to git) mostly
+ * to record vertices strung along dead-straight motorway. DP drops exactly
+ * those and keeps the ones that carry the corner shape, which is the entire
+ * point of the field. 0.5 m is well under a lane width, so nothing visible at
+ * any zoom the game uses survives the simplification.
+ */
+export const SHAPE_SIMPLIFY_TOLERANCE_M = 0.5;
+
+/**
+ * Indices of the vertices Douglas-Peucker keeps at `tolerance` (metres, so
+ * this wants projected not lon/lat input).
+ *
+ * Iterative rather than recursive on purpose: a 1000 km bake
+ * (MAX_DISTANCE_KM) can arrive as a six-figure vertex count, and the
+ * recursive formulation blows the stack on near-degenerate inputs.
+ */
+export function simplifyIndices(pts: Array<{ x: number; y: number }>, tolerance: number): number[] {
+  const n = pts.length;
+  if (n <= 2) return pts.map((_, i) => i);
+
+  const keep = new Uint8Array(n);
+  keep[0] = 1;
+  keep[n - 1] = 1;
+
+  const stack: Array<[number, number]> = [[0, n - 1]];
+  while (stack.length > 0) {
+    const [first, last] = stack.pop()!;
+    const a = pts[first]!;
+    const b = pts[last]!;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const segLen2 = dx * dx + dy * dy;
+
+    let maxDist = -1;
+    let maxIdx = -1;
+    for (let i = first + 1; i < last; i++) {
+      const p = pts[i]!;
+      let d: number;
+      if (segLen2 === 0) {
+        // Degenerate segment (a duplicated vertex): fall back to point distance.
+        d = Math.hypot(p.x - a.x, p.y - a.y);
+      } else {
+        const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / segLen2));
+        d = Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+      }
+      if (d > maxDist) {
+        maxDist = d;
+        maxIdx = i;
+      }
+    }
+
+    if (maxDist > tolerance && maxIdx > 0) {
+      keep[maxIdx] = 1;
+      stack.push([first, maxIdx], [maxIdx, last]);
+    }
+  }
+
+  const kept: number[] = [];
+  for (let i = 0; i < n; i++) if (keep[i]) kept.push(i);
+  return kept;
 }
 
 // --- §5.4: sample elevation at 100 m intervals, interpolate onto 25 m grid ---
@@ -927,11 +996,24 @@ async function bakeGeometry(
     ...(limitMs[i] !== undefined ? { limit: round(limitMs[i]!, 2) } : {}),
   }));
 
+  // Render-only: the source geometry before §5.3 resampling flattens every
+  // sub-25 m turn into a chord. Simplified only enough to drop redundant
+  // straight-line vertices — see SHAPE_SIMPLIFY_TOLERANCE_M.
+  const shapeIndices = simplifyIndices(projected, SHAPE_SIMPLIFY_TOLERANCE_M);
+  const shape = shapeIndices.map(
+    (i) => [round(coords[i]![0], 6), round(coords[i]![1], 6)] as [number, number],
+  );
+  console.log(
+    `Render shape: ${shape.length} vertices ` +
+      `(from ${coords.length} source, simplified at ${SHAPE_SIMPLIFY_TOLERANCE_M} m; ${n} grid points)`,
+  );
+
   const route: Route = {
     origin: { lon: lon0, lat: lat0 },
     totalDistance: round(totalDistance, 2),
     spacing: SPACING,
     points,
+    shape,
   };
 
   return {
