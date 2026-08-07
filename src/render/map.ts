@@ -516,8 +516,48 @@ function removeRouteLayers(map: MapLibreMap, slug: string): void {
  * lines go on first of all so `addRouteLayers`'s `beforeId` has something to
  * aim at.
  */
+/**
+ * Thin out the hosted styles' road labelling.
+ *
+ * A general-purpose road map labels a highway the way a *map reader* wants it:
+ * repeatedly, so the number is never far from wherever your eye lands. With
+ * `symbol-placement: line` that means a shield every `symbol-spacing` pixels
+ * along every carriageway — and a dual carriageway is two OSM ways, so a
+ * motorway comes out as two parallel columns of the same number, twenty deep.
+ *
+ * Here the road is not the subject; the race on it is. So shields switch to
+ * `line-center`, which places exactly one per line feature, and road names get
+ * a much larger spacing. Both are done by *source layer* rather than by layer
+ * id, so it works across Liberty, Positron and Dark without hardcoding three
+ * sets of names, and is a no-op on the satellite style (which has no
+ * `transportation_name` layers at all).
+ */
+const ROAD_NAME_SPACING_PX = 900;
+
+function thinRoadLabels(map: MapLibreMap): void {
+  for (const layer of map.getStyle().layers) {
+    if (layer.type !== 'symbol') continue;
+    const sourceLayer = (layer as { 'source-layer'?: string })['source-layer'];
+    if (sourceLayer !== 'transportation_name') continue;
+
+    const hasIcon = Boolean(layer.layout && 'icon-image' in layer.layout);
+    if (hasIcon) {
+      // Shields. Kept as a zoom step because these styles use point placement
+      // at low zoom, where a "line" has been generalised to almost nothing and
+      // line-center would drop the label entirely.
+      map.setLayoutProperty(layer.id, 'symbol-placement', ['step', ['zoom'], 'point', 11, 'line-center']);
+    } else {
+      // Names. Still repeated — a long road genuinely wants its name more than
+      // once — but at a spacing measured against the viewport rather than a
+      // paragraph of them.
+      map.setLayoutProperty(layer.id, 'symbol-spacing', ROAD_NAME_SPACING_PX);
+    }
+  }
+}
+
 function addAppLayers(map: MapLibreMap, routes: Map<string, Route>): void {
   map.setSky(SKY);
+  thinRoadLabels(map);
 
   // A hosted style has no DEM source of its own — without this the relief
   // toggle silently does nothing after a swap.
