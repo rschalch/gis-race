@@ -115,8 +115,35 @@ const BEARING_EASING = 0.045;
 const BEARING_DEAD_BAND_DEG = 1.2;
 
 /** Cinematic pitch when nothing is in the way. Above the ~71.6° horizon
- * threshold, so the sky stays in frame — see DEFAULT_FOLLOW_PITCH in map.ts. */
+ * threshold, so the sky stays in frame — see DEFAULT_FOLLOW_PITCH in map.ts.
+ * A camera preset can override it per map (see setClearPitch): a helicopter
+ * shot wants to look down, a chase shot wants to look along the road. */
 const CLEAR_PITCH = 75;
+
+const clearPitchByMap = new WeakMap<MapLibreMap, number>();
+
+function clearPitchFor(map: MapLibreMap): number {
+  return clearPitchByMap.get(map) ?? CLEAR_PITCH;
+}
+
+/** Camera presets set the pitch the chase camera settles at when its line of
+ * sight is clear. The obstruction logic still overrides it — rising over a
+ * hillside beats any preset. */
+export function setClearPitch(map: MapLibreMap, pitch: number): void {
+  clearPitchByMap.set(map, pitch);
+}
+
+/**
+ * How long the swing into follow mode takes, in milliseconds.
+ *
+ * Entering follow from an overview of a 225 km route used to be a hard cut
+ * from "whole route" to "one street", which reads as a glitch rather than a
+ * camera move. The intro is a single easeTo — and the per-frame jumpTo is
+ * suspended for its duration, because jumpTo calls stop() internally and would
+ * cancel the ease on the very next frame (the same mechanism documented on
+ * installZoomGuard).
+ */
+const INTRO_DURATION_MS = 700;
 
 /** Highest the camera climbs (lowest pitch) to see over an obstruction. */
 const BLOCKED_PITCH = 42;
@@ -143,6 +170,9 @@ interface ChaseState {
   blocked: boolean;
   /** Cleared after the first frame, which is the only one that sets zoom. */
   needsInitialZoom: boolean;
+  /** Wall-clock ms after which the per-frame camera update resumes; set while
+   * the intro ease is in flight. */
+  introUntil: number;
 }
 
 const stateByMap = new WeakMap<MapLibreMap, ChaseState>();
@@ -180,7 +210,7 @@ function getState(map: MapLibreMap): ChaseState {
   installZoomGuard(map);
   let s = stateByMap.get(map);
   if (!s) {
-    s = { bearing: null, pitch: CLEAR_PITCH, frame: 0, blocked: false, needsInitialZoom: true };
+    s = { bearing: null, pitch: clearPitchFor(map), frame: 0, blocked: false, needsInitialZoom: true, introUntil: 0 };
     stateByMap.set(map, s);
   }
   return s;
@@ -264,7 +294,7 @@ export function updateChaseCamera(
   if (state.frame % OCCLUSION_TEST_INTERVAL === 0) {
     state.blocked = isCarBlocked(map, lon, lat, state.bearing, state.pitch);
   }
-  const targetPitch = state.blocked ? BLOCKED_PITCH : CLEAR_PITCH;
+  const targetPitch = state.blocked ? BLOCKED_PITCH : clearPitchFor(map);
   const pitchDelta = targetPitch - state.pitch;
   state.pitch += Math.sign(pitchDelta) * Math.min(Math.abs(pitchDelta), PITCH_STEP_DEG);
 
@@ -276,8 +306,19 @@ export function updateChaseCamera(
 
   if (state.needsInitialZoom) {
     state.needsInitialZoom = false;
-    map.jumpTo({ center: [lon, lat], zoom, pitch: state.pitch, bearing: state.bearing });
+    state.introUntil = performance.now() + INTRO_DURATION_MS;
+    map.easeTo({
+      center: [lon, lat],
+      zoom,
+      pitch: state.pitch,
+      bearing: state.bearing,
+      duration: INTRO_DURATION_MS,
+    });
     return;
   }
+  // Hands off while the intro ease plays — see INTRO_DURATION_MS. The car
+  // keeps moving during it, so the first jumpTo afterwards closes a gap of at
+  // most a few car lengths.
+  if (performance.now() < state.introUntil) return;
   map.jumpTo({ center: [lon, lat], pitch: state.pitch, bearing: state.bearing });
 }

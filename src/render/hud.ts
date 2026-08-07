@@ -26,7 +26,7 @@ function severityLabel(severity: Incident['severity']): string {
   }
 }
 
-export type CameraMode = 'overview' | 'follow' | 'free';
+export type CameraMode = 'overview' | 'follow' | 'free' | 'tv';
 
 export interface CameraState {
   mode: CameraMode;
@@ -38,6 +38,8 @@ export interface HudCallbacks {
   onFollowLeader: () => void;
   onOverview: () => void;
   onFree: () => void;
+  onTv: () => void;
+  onCameraPreset: (preset: string) => void;
 }
 
 export interface HudInstance {
@@ -121,11 +123,17 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
       callbacks.onSelectCar(row.dataset.carId!);
       return;
     }
+    const presetButton = target.closest<HTMLElement>('[data-camera-preset]');
+    if (presetButton) {
+      callbacks.onCameraPreset(presetButton.dataset.cameraPreset!);
+      return;
+    }
     const cameraButton = target.closest<HTMLElement>('[data-camera-mode]');
     if (cameraButton) {
       const mode = cameraButton.dataset.cameraMode;
       if (mode === 'overview') callbacks.onOverview();
       else if (mode === 'leader') callbacks.onFollowLeader();
+      else if (mode === 'tv') callbacks.onTv();
       else if (mode === 'free') callbacks.onFree();
     }
   });
@@ -135,7 +143,14 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
     <div class="camera-controls">
       <button data-camera-mode="overview">Overview</button>
       <button data-camera-mode="leader">Follow Leader</button>
+      <button data-camera-mode="tv" title="Broadcast coverage — cuts between tracking shots">TV</button>
       <button data-camera-mode="free">Free</button>
+      <span class="camera-presets">
+        <button data-camera-preset="onboard" title="Onboard — close and low">Onboard</button>
+        <button data-camera-preset="close">Close</button>
+        <button data-camera-preset="wide">Wide</button>
+        <button data-camera-preset="heli" title="Helicopter — high and looking down">Heli</button>
+      </span>
     </div>
     <div class="leaderboard-scroll">
       <table class="leaderboard">
@@ -255,6 +270,7 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
       .get('leader')!
       .classList.toggle('active', camera.mode === 'follow' && camera.target === 'leader');
     d.cameraButtons.get('free')!.classList.toggle('active', camera.mode === 'free');
+    d.cameraButtons.get('tv')!.classList.toggle('active', camera.mode === 'tv');
 
     // Rank by projected own-running-time, not road position: under an
     // interval start the car physically furthest down the road may simply

@@ -17,6 +17,22 @@
     <div id="config-panel" hidden></div>
     <div id="race-controls"></div>
     <div id="hud"></div>
+    <div id="minimap-panel">
+      <canvas id="minimap"></canvas>
+      <div id="map-view-controls">
+        <select id="basemap-select" aria-label="Basemap"></select>
+        <label id="relief-toggle" title="3D terrain. Costs DEM tiles and CPU to decode.">
+          <input type="checkbox" id="relief-enabled" /> Relief
+        </label>
+        <input type="range" id="relief-exaggeration" min="1" max="4" step="0.2" value="1.8"
+               aria-label="Relief exaggeration" title="Vertical exaggeration" />
+      </div>
+      <div id="curvature-legend">
+        <span class="legend-title">Corner radius</span>
+        <span class="legend-scale"></span>
+        <span class="legend-ends"><span>tight</span><span>open</span></span>
+      </div>
+    </div>
     <canvas id="profile"></canvas>
     <div id="summary" hidden></div>
     <script type="module" src="/src/main.ts"></script>

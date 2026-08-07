@@ -9,11 +9,24 @@ import {
   resetChaseCam,
   onCarClick,
   onUserPan,
+  setIncidentMarkers,
+  setCautionZones,
+  setCameraPreset,
+  setBasemap,
+  setTerrainEnabled,
+  setTerrainExaggeration,
+  tvCar,
+  CAMERA_PRESETS,
+  BASEMAP_LABELS,
+  type BasemapId,
+  type IncidentMarker,
+  type CameraPreset,
 } from './render/map';
 import { initHud, type CameraState } from './render/hud';
 import { initRaceControls, TIME_SCALES } from './render/race-controls';
 import { initKeyboard } from './render/keyboard';
 import { initProfile } from './render/profile';
+import { initMinimap } from './render/minimap';
 import { initConfigPanel, type ConfigApplyResult } from './render/config-panel';
 import { initRoutesPanel } from './render/routes-panel';
 import { initSummary } from './render/summary';
@@ -22,7 +35,7 @@ import { createSim, tick, resolveLeader, raceRank, type CarAssignment, type Sim 
 import type { CarState, Incident, Route, Weather } from './types';
 import { loadCars } from './cars';
 import { MAX_FIELD_SIZE, buildFairField, tierOf } from './roster';
-import { START_INTERVAL_S } from './tuning';
+import { START_INTERVAL_S, CAUTION_AHEAD_M, CAUTION_BEHIND_M } from './tuning';
 
 const HUD_INTERVAL_S = 0.1; // ~10 Hz (P2) — HUD text writes, not map markers
 
@@ -118,6 +131,7 @@ async function bootstrap() {
   const routesTriggerOrNull = document.getElementById('routes-trigger');
   const routesPanelOrNull = document.getElementById('routes-panel');
   const profileCanvasOrNull = document.getElementById('profile');
+  const minimapCanvasOrNull = document.getElementById('minimap');
   const summaryContainerOrNull = document.getElementById('summary');
   if (!mapContainer) throw new Error('#map container not found');
   if (!hudContainerOrNull) throw new Error('#hud container not found');
@@ -127,11 +141,13 @@ async function bootstrap() {
   if (!routesTriggerOrNull) throw new Error('#routes-trigger not found');
   if (!routesPanelOrNull) throw new Error('#routes-panel not found');
   if (!(profileCanvasOrNull instanceof HTMLCanvasElement)) throw new Error('#profile canvas not found');
+  if (!(minimapCanvasOrNull instanceof HTMLCanvasElement)) throw new Error('#minimap canvas not found');
   if (!summaryContainerOrNull) throw new Error('#summary container not found');
   const summaryContainer: HTMLElement = summaryContainerOrNull;
   const hudContainer: HTMLElement = hudContainerOrNull;
   const raceControlsContainer: HTMLElement = raceControlsContainerOrNull;
   const profileCanvas: HTMLCanvasElement = profileCanvasOrNull;
+  const minimapCanvas: HTMLCanvasElement = minimapCanvasOrNull;
 
   const routeStore = createRouteStore(routeIndex);
   const initialRouteSlug = routeIndex[0]!.slug;
@@ -163,6 +179,21 @@ async function bootstrap() {
       onFree: () => {
         state.camera = { mode: 'free', target: state.camera.target };
       },
+      onTv: () => {
+        // TV mode needs someone to point at; falls back to the leader, which
+        // is what a director would do anyway.
+        state.camera = { mode: 'tv', target: state.camera.target ?? 'leader' };
+        resetChaseCam(map);
+      },
+      onCameraPreset: (preset) => {
+        if (!(preset in CAMERA_PRESETS)) return;
+        setCameraPreset(map, preset as CameraPreset);
+        // A preset is a request to look at something, so it also drops you
+        // into a mode where the camera is actually pointed at a car.
+        if (state.camera.mode === 'overview' || state.camera.mode === 'free') {
+          state.camera = { mode: 'follow', target: state.camera.target ?? 'leader' };
+        }
+      },
     });
 
     const raceControls = initRaceControls(raceControlsContainer, {
@@ -193,7 +224,39 @@ async function bootstrap() {
       }
     }
 
+    // Map-view controls (basemap, relief). Live settings: they change what you
+    // are looking at right now, so they deliberately do not go through the
+    // race-config modal's Apply & Restart.
+    const basemapSelect = document.getElementById('basemap-select') as HTMLSelectElement | null;
+    const reliefEnabled = document.getElementById('relief-enabled') as HTMLInputElement | null;
+    const reliefExaggeration = document.getElementById('relief-exaggeration') as HTMLInputElement | null;
+    if (basemapSelect && reliefEnabled && reliefExaggeration) {
+      for (const [id, label] of Object.entries(BASEMAP_LABELS)) {
+        const option = document.createElement('option');
+        option.value = id;
+        option.textContent = label;
+        basemapSelect.appendChild(option);
+      }
+      basemapSelect.addEventListener('change', () => {
+        // Disabled rather than queued: a style swap takes a second or two and
+        // stacking them upsets MapLibre's symbol buckets (see setBasemap).
+        basemapSelect.disabled = true;
+        setBasemap(map, basemapSelect.value as BasemapId, state.routesBySlug).finally(() => {
+          basemapSelect.disabled = false;
+        });
+      });
+      reliefEnabled.addEventListener('change', () => {
+        setTerrainEnabled(map, reliefEnabled.checked, Number(reliefExaggeration.value));
+      });
+      reliefExaggeration.addEventListener('input', () => {
+        setTerrainExaggeration(map, Number(reliefExaggeration.value));
+      });
+    }
+
     const profile = initProfile(profileCanvas);
+    // Shares the elevation strip's cadence: both show a whole route at once,
+    // where a car covers a fraction of a pixel per second.
+    const minimap = initMinimap(minimapCanvas);
 
     const summary = initSummary(summaryContainer, {
       onReplaySeed: (seed) => {
@@ -211,8 +274,23 @@ async function bootstrap() {
       onClose: () => {},
     });
 
+    // Where every incident this race happened, in map coordinates. Append-only
+    // within a race and cleared by rebuildRace — the map should mark the crash
+    // sites of the race you are watching, not the last one.
+    let incidentMarkers: IncidentMarker[] = [];
+
     function handleIncident(car: CarState, incident: Incident): void {
       hud.pushIncident(car, incident);
+      const at = interpolateAt(car.route, incident.s);
+      incidentMarkers = [
+        ...incidentMarkers,
+        {
+          lon: at.lon,
+          lat: at.lat,
+          terminal: incident.severity === 'off-road' || incident.severity === 'mechanical',
+        },
+      ];
+      setIncidentMarkers(map, incidentMarkers);
       if (import.meta.env.DEV) {
         console.log(
           `[incident] ${car.spec.name} ${incident.severity} at s=${incident.s.toFixed(0)}m ` +
@@ -246,6 +324,8 @@ async function bootstrap() {
       // race" latch would suppress it for every subsequent race.
       summary.reset();
       simGeneration += 1;
+      incidentMarkers = [];
+      setIncidentMarkers(map, incidentMarkers);
       return {
         carAssignments: overrides.carAssignments,
         routesBySlug: overrides.routesBySlug,
@@ -420,9 +500,10 @@ async function bootstrap() {
       }
       lastRenderKey = key;
 
+      const cameraFollowsACar = state.camera.mode === 'follow' || state.camera.mode === 'tv';
       const selectedCar = resolveCameraTargetCar(
         state.sim.cars,
-        state.camera.mode === 'follow' ? state.camera.target : null,
+        cameraFollowsACar ? state.camera.target : null,
         state.sim.simTime,
       );
 
@@ -452,7 +533,10 @@ async function bootstrap() {
         now,
       );
 
-      if (state.camera.mode === 'follow' && selectedCar) {
+      if (state.camera.mode === 'tv' && selectedCar) {
+        const sample = samples.get(selectedCar.spec.id)!;
+        tvCar(map, sample.lon, sample.lat, headingAt(selectedCar.route, selectedCar.s), now);
+      } else if (state.camera.mode === 'follow' && selectedCar) {
         const sample = samples.get(selectedCar.spec.id)!;
         // Heading comes straight from route geometry at the car's `s` — the
         // sim has no notion of it, same as lon/lat. The camera's window is
@@ -483,12 +567,26 @@ async function bootstrap() {
       profileAccumulator += realDeltaSeconds;
       if (profileAccumulator >= PROFILE_INTERVAL_S) {
         profileAccumulator = 0;
+
+        // R6 caution zones. Hazards expire on their own clock, so this has to
+        // be re-read rather than pushed on incident — but it is a handful of
+        // entries and it shares the elevation strip's cadence, not the frame's.
+        setCautionZones(
+          map,
+          state.sim.hazards.map((h) => ({
+            route: h.route,
+            s: h.s,
+            behindM: CAUTION_BEHIND_M,
+            aheadM: CAUTION_AHEAD_M,
+          })),
+        );
         const primaryCar =
           selectedCar ?? (state.sim.cars.length > 0 ? resolveLeader(state.sim.cars, state.sim.simTime) : null);
         if (primaryCar) {
           const carsOnPrimaryRoute = state.sim.cars.filter((c) => c.route === primaryCar.route);
           profile.render(primaryCar.route, carsOnPrimaryRoute, samples, selectedCar ?? undefined);
         }
+        minimap.render(state.routesBySlug, state.sim.cars, selectedCar ?? undefined);
       }
 
       requestAnimationFrame(frame);

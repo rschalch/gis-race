@@ -52,6 +52,39 @@ const TERRAIN_TILES = 'https://tiles.mapterhorn.com/{z}/{x}/{y}.webp';
 // biggest terrain saving — DEM decode is per-pixel CPU work on the main thread.
 const TERRAIN_MAX_DEM_ZOOM = 12;
 
+/**
+ * The DEM source on its own.
+ *
+ * A hosted basemap style knows nothing about our terrain, so switching to one
+ * would drop the source the relief toggle depends on. Both the built style
+ * below and the style-swap path in map.ts add this same object.
+ */
+export function demSource(): NonNullable<StyleSpecification['sources']>[string] {
+  return {
+    type: 'raster-dem',
+    tiles: [TERRAIN_TILES],
+    encoding: 'terrarium',
+    tileSize: 512,
+    maxzoom: TERRAIN_MAX_DEM_ZOOM,
+    attribution: "<a href='https://mapterhorn.com/attribution'>© Mapterhorn</a>",
+  };
+}
+
+/**
+ * Hosted vector styles offered alongside the satellite one built here.
+ *
+ * Pointing at OpenFreeMap's own styles rather than hand-writing three more
+ * cartographic stylesheets: a road map is 100+ layers of carefully ordered
+ * casings, labels and shields, and reproducing that badly is worse than not
+ * offering it. They serve the same vector tiles this style already uses for
+ * buildings and place names.
+ */
+export const HOSTED_BASEMAPS = {
+  road: { url: 'https://tiles.openfreemap.org/styles/liberty', label: 'Road' },
+  minimal: { url: 'https://tiles.openfreemap.org/styles/positron', label: 'Minimal' },
+  dark: { url: 'https://tiles.openfreemap.org/styles/dark', label: 'Dark' },
+} as const;
+
 export function buildBasemapStyle(): StyleSpecification {
   return {
     version: 8,
@@ -71,14 +104,7 @@ export function buildBasemapStyle(): StyleSpecification {
       },
       // Registered but not enabled — map.ts leaves setTerrain to the
       // TerrainControl, so DEM tiles are only fetched once terrain is asked for.
-      [TERRAIN_SOURCE_ID]: {
-        type: 'raster-dem',
-        tiles: [TERRAIN_TILES],
-        encoding: 'terrarium',
-        tileSize: 512,
-        maxzoom: TERRAIN_MAX_DEM_ZOOM,
-        attribution: "<a href='https://mapterhorn.com/attribution'>© Mapterhorn</a>",
-      },
+      [TERRAIN_SOURCE_ID]: demSource(),
     },
     // Directional light, so extruded buildings are shaded rather than flat
     // slabs of one colour. Anchored to the map (not the viewport) so the

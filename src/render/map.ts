@@ -10,7 +10,6 @@
 import {
   Map as MapLibreMap,
   NavigationControl,
-  TerrainControl,
   type ExpressionSpecification,
   type GeoJSONSource,
   type LngLatBoundsLike,
@@ -21,9 +20,10 @@ import {
 import type { Feature, FeatureCollection, LineString, Point } from 'geojson';
 import type { Route, VehicleType } from '../types';
 
-import { buildBasemapStyle, TERRAIN_SOURCE_ID } from './basemap';
-import { createCarOverlay, updateCars3D } from './cars-3d';
-import { updateChaseCamera, resetChaseCamera, isCarBlocked } from './chase-camera';
+import { buildBasemapStyle, demSource, HOSTED_BASEMAPS, TERRAIN_SOURCE_ID } from './basemap';
+import { createCarOverlay, updateCars3D, resetModelCulling } from './cars-3d';
+import { updateChaseCamera, resetChaseCamera, setClearPitch, isCarBlocked } from './chase-camera';
+import { updateTvCamera, resetTvCamera } from './tv-camera';
 import type { MapboxOverlay } from '@deck.gl/mapbox';
 
 const CARS_SOURCE_ID = 'cars';
@@ -224,7 +224,35 @@ function unionBounds(routes: Route[]): LngLatBoundsLike {
   ];
 }
 
-function addRouteLayers(map: MapLibreMap, slug: string, route: Route): void {
+/**
+ * Casing colours, one per route variant in play (F1).
+ *
+ * The curvature gradient carries the *information*, so the variant identity
+ * goes on the casing underneath it — with three alternates of one course on
+ * screen at once, an all-grey casing gives no way to tell which road a car is
+ * actually on.
+ */
+const VARIANT_CASINGS = ['#334155', '#4c1d95', '#134e4a', '#7c2d12', '#164e63'];
+
+function casingColour(index: number): string {
+  return VARIANT_CASINGS[index % VARIANT_CASINGS.length]!;
+}
+
+/**
+ * Route line width, in pixels, interpolated over zoom.
+ *
+ * A fixed width cannot serve both ends: 4 px is a thread over a 225 km
+ * overview and a stripe wider than the actual carriageway at chase zoom, where
+ * it hides the road it is describing. Thin far out, and near-transparent
+ * hairlines up close so the satellite imagery shows through.
+ */
+const ROUTE_CASING_WIDTH: ExpressionSpecification = ['interpolate', ['linear'], ['zoom'], 8, 3, 12, 5, 15, 7, 18, 9];
+const ROUTE_CURVATURE_WIDTH: ExpressionSpecification = ['interpolate', ['linear'], ['zoom'], 8, 1.5, 12, 3, 15, 4, 18, 5];
+// At chase zoom the line stops being a map symbol and starts covering the road
+// surface, so it fades to a hint rather than a paint stripe.
+const ROUTE_OPACITY: ExpressionSpecification = ['interpolate', ['linear'], ['zoom'], 13, 1, 16, 0.35];
+
+function addRouteLayers(map: MapLibreMap, slug: string, route: Route, variantIndex: number): void {
   // Route layers added after load (setRouteData on Apply) would otherwise be
   // appended above the cars layer, hiding the car dots under the route lines
   // — insert them beneath it whenever it already exists.
@@ -243,8 +271,9 @@ function addRouteLayers(map: MapLibreMap, slug: string, route: Route): void {
       source: routeSourceId(slug),
       layout: { 'line-join': 'round', 'line-cap': 'round' },
       paint: {
-        'line-color': '#334155',
-        'line-width': 4,
+        'line-color': casingColour(variantIndex),
+        'line-width': ROUTE_CASING_WIDTH,
+        'line-opacity': ROUTE_OPACITY,
       },
     },
     beforeId,
@@ -257,7 +286,8 @@ function addRouteLayers(map: MapLibreMap, slug: string, route: Route): void {
       source: routeSourceId(slug),
       layout: { 'line-join': 'round', 'line-cap': 'round' },
       paint: {
-        'line-width': 2,
+        'line-width': ROUTE_CURVATURE_WIDTH,
+        'line-opacity': ROUTE_OPACITY,
         'line-gradient': buildCurvatureGradientExpression(route),
       },
     },
@@ -265,10 +295,347 @@ function addRouteLayers(map: MapLibreMap, slug: string, route: Route): void {
   );
 }
 
+// --- race information the simulation already knows -------------------------
+//
+// Everything below draws something the sim computes and the map used to keep
+// to itself: where the route starts and ends, where a car actually crashed,
+// and which stretch of road is under caution. The elevation strip and the
+// incident feed had all of it; the map — the thing you are looking at — had
+// none of it.
+
+const MARKERS_SOURCE_ID = 'route-markers';
+const MARKERS_CIRCLE_LAYER_ID = 'route-markers-circle';
+const MARKERS_LABEL_LAYER_ID = 'route-markers-label';
+const INCIDENTS_SOURCE_ID = 'incidents';
+const INCIDENTS_LAYER_ID = 'incidents-circle';
+const CAUTION_SOURCE_ID = 'caution-zones';
+const CAUTION_LAYER_ID = 'caution-line';
+
+/** Distance-marker spacing along a route, metres. */
+const DISTANCE_MARKER_INTERVAL_M = 10_000;
+
+const EMPTY_POINTS: FeatureCollection<Point> = { type: 'FeatureCollection', features: [] };
+const EMPTY_LINES: FeatureCollection<LineString> = { type: 'FeatureCollection', features: [] };
+
+function pointFeature(lon: number, lat: number, properties: Record<string, unknown>): Feature<Point> {
+  return { type: 'Feature', properties, geometry: { type: 'Point', coordinates: [lon, lat] } };
+}
+
+/** Start/finish flags plus a tick every 10 km, for every route in play. */
+function buildRouteMarkers(routes: Map<string, Route>): FeatureCollection<Point> {
+  const features: Feature<Point>[] = [];
+  for (const route of routes.values()) {
+    const first = route.points[0]!;
+    const last = route.points[route.points.length - 1]!;
+    features.push(pointFeature(first.lon, first.lat, { kind: 'start', label: 'START' }));
+    features.push(pointFeature(last.lon, last.lat, { kind: 'finish', label: 'FINISH' }));
+
+    for (let d = DISTANCE_MARKER_INTERVAL_M; d < route.totalDistance - 500; d += DISTANCE_MARKER_INTERVAL_M) {
+      // Nearest baked point rather than an interpolation: these are decorative
+      // ticks, and 25 m of placement error is invisible at any zoom they show.
+      const point = route.points[Math.min(Math.round(d / route.spacing), route.points.length - 1)]!;
+      features.push(pointFeature(point.lon, point.lat, { kind: 'distance', label: `${Math.round(d / 1000)} km` }));
+    }
+  }
+  return { type: 'FeatureCollection', features };
+}
+
+/**
+ * Circle radius, in pixels, that approximates a fixed size on the *ground*.
+ * Web Mercator halves metres-per-pixel with every zoom level, so an
+ * exponential-base-2 interpolation is exact rather than approximate.
+ */
+function groundRadius(metresAtZoom14: number): ExpressionSpecification {
+  return ['interpolate', ['exponential', 2], ['zoom'], 10, metresAtZoom14 / 16, 18, metresAtZoom14 * 16];
+}
+
+function addRaceInfoLayers(map: MapLibreMap): void {
+  map.addSource(MARKERS_SOURCE_ID, { type: 'geojson', data: EMPTY_POINTS });
+  map.addSource(INCIDENTS_SOURCE_ID, { type: 'geojson', data: EMPTY_POINTS });
+  map.addSource(CAUTION_SOURCE_ID, { type: 'geojson', data: EMPTY_LINES });
+
+  // Caution first, so it sits under the markers and cars rather than over them.
+  map.addLayer({
+    id: CAUTION_LAYER_ID,
+    type: 'line',
+    source: CAUTION_SOURCE_ID,
+    layout: { 'line-join': 'round', 'line-cap': 'round' },
+    paint: {
+      'line-color': '#fbbf24',
+      'line-width': ['interpolate', ['linear'], ['zoom'], 8, 4, 12, 8, 16, 14],
+      'line-opacity': 0.55,
+      'line-blur': 2,
+    },
+  });
+
+  map.addLayer({
+    id: MARKERS_CIRCLE_LAYER_ID,
+    type: 'circle',
+    source: MARKERS_SOURCE_ID,
+    paint: {
+      'circle-radius': ['case', ['==', ['get', 'kind'], 'distance'], 3, 6],
+      'circle-color': [
+        'match',
+        ['get', 'kind'],
+        'start',
+        '#22c55e',
+        'finish',
+        '#ef4444',
+        /* distance */ '#e2e8f0',
+      ],
+      'circle-stroke-width': ['case', ['==', ['get', 'kind'], 'distance'], 1, 2],
+      'circle-stroke-color': '#0f172a',
+      // Distance ticks are clutter on an overview of a 400 km route; the
+      // start/finish flags never are.
+      //
+      // Note the nesting: `zoom` is only legal at the TOP level of a paint
+      // property, so the interpolation goes outside and the per-kind choice
+      // becomes the output of each stop. The natural-looking inverse (a `case`
+      // wrapping an `interpolate`) is rejected outright by the style
+      // validator, and MapLibre's response is to drop the whole layer — it
+      // logs to the console and renders nothing, which looks exactly like a
+      // layer that was never added.
+      'circle-opacity': [
+        'interpolate',
+        ['linear'],
+        ['zoom'],
+        9,
+        ['case', ['==', ['get', 'kind'], 'distance'], 0, 1],
+        10.5,
+        ['case', ['==', ['get', 'kind'], 'distance'], 0.9, 1],
+      ],
+    },
+  });
+
+  map.addLayer({
+    id: MARKERS_LABEL_LAYER_ID,
+    type: 'symbol',
+    source: MARKERS_SOURCE_ID,
+    layout: {
+      'text-field': ['get', 'label'],
+      'text-font': ['Noto Sans Regular'],
+      'text-size': ['case', ['==', ['get', 'kind'], 'distance'], 10, 12],
+      'text-offset': [0, 1.2],
+      'text-anchor': 'top',
+      // Let MapLibre drop labels rather than stack them — a 40-tick route
+      // zoomed out would otherwise be a wall of text.
+      'text-allow-overlap': false,
+      'text-optional': true,
+    },
+    paint: {
+      'text-color': '#ffffff',
+      'text-halo-color': 'rgba(0,0,0,0.8)',
+      'text-halo-width': 1.4,
+      // Same top-level-zoom rule as the circle layer above.
+      'text-opacity': [
+        'interpolate',
+        ['linear'],
+        ['zoom'],
+        10.5,
+        ['case', ['==', ['get', 'kind'], 'distance'], 0, 1],
+        11.5,
+        1,
+      ],
+    },
+  });
+
+  map.addLayer({
+    id: INCIDENTS_LAYER_ID,
+    type: 'circle',
+    source: INCIDENTS_SOURCE_ID,
+    paint: {
+      // Sized on the ground, not in pixels: an incident is a place on the road,
+      // and it should grow as you zoom toward it like everything else does.
+      'circle-radius': groundRadius(7),
+      'circle-color': ['case', ['get', 'terminal'], '#ef4444', '#f59e0b'],
+      'circle-opacity': 0.45,
+      'circle-stroke-width': 1.5,
+      'circle-stroke-color': ['case', ['get', 'terminal'], '#fecaca', '#fde68a'],
+      'circle-stroke-opacity': 0.9,
+    },
+  });
+}
+
+/** Where a car lost it, and whether that ended its race. Append-only within a
+ * race; main.ts rebuilds the whole set when a new race starts. */
+export interface IncidentMarker {
+  lon: number;
+  lat: number;
+  terminal: boolean;
+}
+
+export function setIncidentMarkers(map: MapLibreMap, incidents: IncidentMarker[]): void {
+  incidentsByMap.set(map, incidents);
+  const source = map.getSource(INCIDENTS_SOURCE_ID) as GeoJSONSource | undefined;
+  if (!source) return;
+  source.setData({
+    type: 'FeatureCollection',
+    features: incidents.map((i) => pointFeature(i.lon, i.lat, { terminal: i.terminal })),
+  });
+}
+
+/** R6 caution zones — the stretch of road cars are lifting for, drawn as the
+ * stretch it actually is rather than a radius around a point. */
+export function setCautionZones(
+  map: MapLibreMap,
+  zones: Array<{ route: Route; s: number; behindM: number; aheadM: number }>,
+): void {
+  const source = map.getSource(CAUTION_SOURCE_ID) as GeoJSONSource | undefined;
+  if (!source) return;
+
+  const features: Feature<LineString>[] = zones.map(({ route, s, behindM, aheadM }) => {
+    const from = Math.max(0, Math.floor((s - behindM) / route.spacing));
+    const to = Math.min(route.points.length - 1, Math.ceil((s + aheadM) / route.spacing));
+    const coordinates: number[][] = [];
+    for (let i = from; i <= to; i++) coordinates.push([route.points[i]!.lon, route.points[i]!.lat]);
+    // A zone at the very last point would otherwise be a zero-length line,
+    // which renders as nothing at all.
+    if (coordinates.length < 2) coordinates.push(coordinates[0] ?? [0, 0]);
+    return { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates } };
+  });
+
+  source.setData({ type: 'FeatureCollection', features });
+}
+
 function removeRouteLayers(map: MapLibreMap, slug: string): void {
   if (map.getLayer(routeCurvatureLayerId(slug))) map.removeLayer(routeCurvatureLayerId(slug));
   if (map.getLayer(routeLineLayerId(slug))) map.removeLayer(routeLineLayerId(slug));
   if (map.getSource(routeSourceId(slug))) map.removeSource(routeSourceId(slug));
+}
+
+/**
+ * Everything the app itself puts on the map, in the order it has to go on.
+ *
+ * Called once at load and again after every basemap swap: `setStyle` discards
+ * all sources and layers, ours included, so a switcher that did not replay this
+ * exactly would leave a race with no route, no cars, or its markers stacked
+ * above the vehicles. One function, two callers, no second copy to forget.
+ *
+ * Order matters and is not alphabetical: race-information layers go on before
+ * the car circles so cars draw over their own crash markers, and the route
+ * lines go on first of all so `addRouteLayers`'s `beforeId` has something to
+ * aim at.
+ */
+function addAppLayers(map: MapLibreMap, routes: Map<string, Route>): void {
+  map.setSky(SKY);
+
+  // A hosted style has no DEM source of its own — without this the relief
+  // toggle silently does nothing after a swap.
+  if (!map.getSource(TERRAIN_SOURCE_ID)) map.addSource(TERRAIN_SOURCE_ID, demSource());
+
+  let variantIndex = 0;
+  for (const [slug, route] of routes) addRouteLayers(map, slug, route, variantIndex++);
+  trackedSlugs.set(map, new Set(routes.keys()));
+
+  addRaceInfoLayers(map);
+  setRouteMarkers(map, routes);
+  // Crash sites belong to the race, not to the basemap: re-apply whatever was
+  // showing before the swap.
+  setIncidentMarkers(map, incidentsByMap.get(map) ?? []);
+
+  map.addSource(CARS_SOURCE_ID, {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  });
+
+  map.addLayer({
+    id: CARS_LAYER_ID,
+    type: 'circle',
+    source: CARS_SOURCE_ID,
+    paint: {
+      // Two representations of the same car hand over at zoom ~14: dots own
+      // the overview (where a model is sub-pixel), models own the close view.
+      //
+      // Shrinking the dot is not enough to hide it — that was tried and the
+      // white stroke still showed as a crescent under the car. A circle is
+      // drawn flat on the ground, so at 75° pitch it projects to an ellipse
+      // wider than the model's footprint however small the radius. It has to
+      // fade out entirely.
+      'circle-radius': [
+        'interpolate',
+        ['linear'],
+        ['zoom'],
+        12,
+        ['case', ['get', 'selected'], 10, 7],
+        15,
+        ['case', ['get', 'selected'], 6, 4],
+      ],
+      'circle-color': ['get', 'colour'],
+      // Fill always goes: at close zoom the model is the car, and a coloured
+      // disc behind it just muddies the livery.
+      'circle-opacity': ['interpolate', ['linear'], ['zoom'], 13.5, 1, 14.5, 0],
+      'circle-stroke-width': ['case', ['get', 'selected'], 3, 2],
+      'circle-stroke-color': '#ffffff',
+      // Nothing survives the handover, selected included: a flat ring around
+      // a 3D car at 75° pitch projects to an ellipse that never lines up with
+      // the model. Selection is shown by the HUD row, not on the map.
+      'circle-stroke-opacity': ['interpolate', ['linear'], ['zoom'], 13.5, 1, 14.5, 0],
+    },
+  });
+
+  // deck.gl's interleaved layers live inside the style too, so the overlay has
+  // to be rebuilt rather than reused — the old control is detached first or
+  // MapLibre keeps a dead one in its control list forever.
+  const previousOverlay = carOverlayByMap.get(map);
+  if (previousOverlay) map.removeControl(previousOverlay);
+  carOverlayByMap.set(map, createCarOverlay(map));
+  // A fresh overlay has no layers until the next frame's updateCars3D, and the
+  // zoom-culling latch would otherwise think it had already cleared them.
+  resetModelCulling(map);
+}
+
+/** Last incident set handed to setIncidentMarkers, so a basemap swap can put
+ * them back. */
+const incidentsByMap = new WeakMap<MapLibreMap, IncidentMarker[]>();
+
+export type BasemapId = 'satellite' | keyof typeof HOSTED_BASEMAPS;
+
+export const BASEMAP_LABELS: Record<BasemapId, string> = {
+  satellite: 'Satellite',
+  road: HOSTED_BASEMAPS.road.label,
+  minimal: HOSTED_BASEMAPS.minimal.label,
+  dark: HOSTED_BASEMAPS.dark.label,
+};
+
+/**
+ * Swap the basemap under a running race.
+ *
+ * `setStyle` is a demolition: sources, layers, terrain and deck.gl's
+ * interleaved layers all go. Terrain state is captured and restored around it
+ * because a relief toggle that silently switches itself off is a bug, not a
+ * side effect of changing the map's colour scheme.
+ */
+export function setBasemap(map: MapLibreMap, id: BasemapId, routes: Map<string, Route>): Promise<void> {
+  const terrain = map.getTerrain();
+  const exaggeration = terrain?.exaggeration ?? TERRAIN_EXAGGERATION;
+  const terrainWasOn = Boolean(terrain);
+
+  map.setStyle(id === 'satellite' ? buildBasemapStyle() : HOSTED_BASEMAPS[id].url, { diff: false });
+
+  // Resolves when the new style is live and everything has been put back, so
+  // the caller can keep the control disabled until then. Starting a second
+  // swap while the first is still loading its sprite is what produced
+  // MapLibre's `bucket.icon.opacityVertexArray.length !== ...` assertion in
+  // testing — swapping four styles in four seconds. One at a time is both the
+  // fix and what a person would do anyway.
+  return new Promise((resolve) => {
+    map.once('style.load', () => {
+      addAppLayers(map, routes);
+      if (terrainWasOn) map.setTerrain({ source: TERRAIN_SOURCE_ID, exaggeration });
+      resolve();
+    });
+  });
+}
+
+/** Relief on/off and how much of it, driven from the app's own control rather
+ * than MapLibre's TerrainControl — the built-in one owns the exaggeration it
+ * was constructed with, which makes a separate slider fight it. */
+export function setTerrainEnabled(map: MapLibreMap, enabled: boolean, exaggeration: number): void {
+  map.setTerrain(enabled ? { source: TERRAIN_SOURCE_ID, exaggeration } : null);
+}
+
+export function setTerrainExaggeration(map: MapLibreMap, exaggeration: number): void {
+  if (map.getTerrain()) map.setTerrain({ source: TERRAIN_SOURCE_ID, exaggeration });
 }
 
 export function initMap(
@@ -303,66 +670,14 @@ export function initMap(
   });
 
   map.on('load', () => {
-
     // bottom-right, not the MapLibre default top-right: the entire top strip
     // is already spoken for (#hud left, #race-controls centre, #panel-triggers
     // right at top/right: 12px). Controls placed top-right land *underneath*
     // the Config/Routes buttons — confirmed in the browser, where only the
     // second-stacked control peeked out below them.
-    map.setSky(SKY);
-
     map.addControl(new NavigationControl({ visualizePitch: true }), 'bottom-right');
-    // DEM tiles are a real bandwidth cost and the relief is pure decoration
-    // on the flat routes — give it an off switch rather than forcing it.
-    map.addControl(
-      new TerrainControl({ source: TERRAIN_SOURCE_ID, exaggeration: TERRAIN_EXAGGERATION }),
-      'bottom-right',
-    );
 
-    for (const [slug, route] of routes) addRouteLayers(map, slug, route);
-    trackedSlugs.set(map, new Set(routes.keys()));
-
-    map.addSource(CARS_SOURCE_ID, {
-      type: 'geojson',
-      data: { type: 'FeatureCollection', features: [] },
-    });
-
-    map.addLayer({
-      id: CARS_LAYER_ID,
-      type: 'circle',
-      source: CARS_SOURCE_ID,
-      paint: {
-        // Two representations of the same car hand over at zoom ~14: dots own
-        // the overview (where a model is sub-pixel), models own the close view.
-        //
-        // Shrinking the dot is not enough to hide it — that was tried and the
-        // white stroke still showed as a crescent under the car. A circle is
-        // drawn flat on the ground, so at 75° pitch it projects to an ellipse
-        // wider than the model's footprint however small the radius. It has to
-        // fade out entirely.
-        'circle-radius': [
-          'interpolate',
-          ['linear'],
-          ['zoom'],
-          12,
-          ['case', ['get', 'selected'], 10, 7],
-          15,
-          ['case', ['get', 'selected'], 6, 4],
-        ],
-        'circle-color': ['get', 'colour'],
-        // Fill always goes: at close zoom the model is the car, and a coloured
-        // disc behind it just muddies the livery.
-        'circle-opacity': ['interpolate', ['linear'], ['zoom'], 13.5, 1, 14.5, 0],
-        'circle-stroke-width': ['case', ['get', 'selected'], 3, 2],
-        'circle-stroke-color': '#ffffff',
-        // Nothing survives the handover, selected included: a flat ring around
-        // a 3D car at 75° pitch projects to an ellipse that never lines up with
-        // the model. Selection is shown by the HUD row, not on the map.
-        'circle-stroke-opacity': ['interpolate', ['linear'], ['zoom'], 13.5, 1, 14.5, 0],
-      },
-    });
-
-    carOverlayByMap.set(map, createCarOverlay(map));
+    addAppLayers(map, routes);
 
     map.on('mouseenter', CARS_LAYER_ID, () => {
       map.getCanvas().style.cursor = 'pointer';
@@ -398,16 +713,33 @@ export function setRouteData(map: MapLibreMap, routes: Map<string, Route>): void
   for (const slug of previous) {
     if (!routes.has(slug)) removeRouteLayers(map, slug);
   }
+  let variantIndex = 0;
   for (const [slug, route] of routes) {
+    const index = variantIndex++;
     if (previous.has(slug)) {
       const source = map.getSource(routeSourceId(slug)) as GeoJSONSource;
       source.setData(routeToLineString(route));
       map.setPaintProperty(routeCurvatureLayerId(slug), 'line-gradient', buildCurvatureGradientExpression(route));
+      // Casing colour is positional (which variant is this, of the ones on
+      // screen), so it has to be re-asserted when the set changes.
+      map.setPaintProperty(routeLineLayerId(slug), 'line-color', casingColour(index));
     } else {
-      addRouteLayers(map, slug, route);
+      addRouteLayers(map, slug, route, index);
     }
   }
   trackedSlugs.set(map, new Set(routes.keys()));
+  setRouteMarkers(map, routes);
+  // A new race has no incidents and no cautions; leaving the old ones up would
+  // mark crash sites from a race that is over.
+  setIncidentMarkers(map, []);
+  setCautionZones(map, []);
+}
+
+/** Start/finish flags and distance ticks for the routes now in play. */
+export function setRouteMarkers(map: MapLibreMap, routes: Map<string, Route>): void {
+  const source = map.getSource(MARKERS_SOURCE_ID) as GeoJSONSource | undefined;
+  if (!source) return;
+  source.setData(buildRouteMarkers(routes));
 }
 
 // Zoom at which `circle-opacity` has interpolated all the way to 0 (see the
@@ -555,6 +887,46 @@ export function followCar(map: MapLibreMap, lon: number, lat: number, heading: n
  */
 export function resetChaseCam(map: MapLibreMap): void {
   resetChaseCamera(map);
+  resetTvCamera(map);
+}
+
+/**
+ * Camera presets: how far back the follow camera sits, and how far it looks
+ * down from there.
+ *
+ * Zoom was already user state (F3) — the wheel and the ± buttons set it and
+ * the camera reads it. These are shortcuts to useful values, plus the matching
+ * pitch, because the two are not independent: a helicopter view that keeps the
+ * chase camera's 75° pitch is looking at the horizon from 3 km up, and an
+ * onboard view flattened to 45° is looking at the bonnet.
+ */
+export const CAMERA_PRESETS = {
+  onboard: { zoom: 16.5, pitch: 80, label: 'Onboard' },
+  close: { zoom: 15, pitch: 75, label: 'Close' },
+  wide: { zoom: 13.5, pitch: 62, label: 'Wide' },
+  heli: { zoom: 11.5, pitch: 35, label: 'Helicopter' },
+} as const;
+
+export type CameraPreset = keyof typeof CAMERA_PRESETS;
+
+export function setCameraPreset(map: MapLibreMap, preset: CameraPreset): void {
+  const { zoom, pitch } = CAMERA_PRESETS[preset];
+  followZoomByMap.set(map, zoom);
+  setClearPitch(map, pitch);
+  // The chase camera only writes zoom on its first frame after a reset (that
+  // is what keeps the wheel working), so a preset has to reset it to be
+  // applied at all — which also gives the change the intro ease for free.
+  resetChaseCamera(map);
+  resetTvCamera(map);
+}
+
+/**
+ * §8.1 camera mode 4: broadcast coverage — see tv-camera.ts. Shares the follow
+ * camera's zoom so the presets above still mean something here.
+ */
+export function tvCar(map: MapLibreMap, lon: number, lat: number, heading: number, now: number): void {
+  const zoom = followZoomByMap.get(map) ?? DEFAULT_FOLLOW_ZOOM;
+  updateTvCamera(map, lon, lat, heading, zoom, now);
 }
 
 /** Fires with a car's id whenever the user clicks its dot on the map. */

@@ -168,6 +168,18 @@ const CAR_MATERIAL = {
  * the empty update is pushed exactly once per crossing instead of per frame. */
 const modelsClearedByMap = new WeakMap<MapLibreMap, boolean>();
 
+/**
+ * Forget that latch.
+ *
+ * A basemap swap rebuilds the deck.gl overlay from scratch, so the new one has
+ * no layers — but the latch would still say "already cleared" and skip the
+ * update that puts the models back. Called by map.ts after it recreates the
+ * overlay.
+ */
+export function resetModelCulling(map: MapLibreMap): void {
+  modelsClearedByMap.delete(map);
+}
+
 export function createCarOverlay(map: MapLibreMap): MapboxOverlay {
   const overlay = new MapboxOverlay({ interleaved: true, layers: [] });
   map.addControl(overlay);

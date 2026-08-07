@@ -146,8 +146,42 @@ body {
 
 .camera-controls {
   display: flex;
+  align-items: center;
   gap: 6px;
   margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+/* Zoom/pitch presets are a different kind of control from the mode buttons —
+ * they modify the active view rather than switching what the camera follows —
+ * so they are grouped, de-emphasised, and given their own row.
+ *
+ * The row is not cosmetic: #race-controls is centred in the viewport at a
+ * higher z-index and overlaps the HUD's top strip, so a preset sitting to the
+ * right of the mode buttons lands *underneath* it and cannot be clicked. Same
+ * trap the map controls hit (see the bottom-right note in map.ts). */
+.camera-presets {
+  display: flex;
+  gap: 4px;
+  flex-basis: 100%;
+  padding-top: 6px;
+  border-top: 1px solid #1e293b;
+}
+
+.camera-presets button {
+  font: inherit;
+  font-size: 11px;
+  background: transparent;
+  color: #94a3b8;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 3px 7px;
+  cursor: pointer;
+}
+
+.camera-presets button:hover {
+  background: #1e293b;
+  color: #f1f5f9;
 }
 
 .camera-controls button {
@@ -1591,4 +1625,104 @@ body {
 
 .shortcut-list span {
   color: #94a3b8;
+}
+
+/* --- Route overview inset -------------------------------------------------
+ * Bottom-left, above the elevation strip: the HUD owns the top-left and the
+ * map controls the bottom-right. Sits over the map, so it carries the same
+ * translucent panel treatment as the HUD.
+ */
+#minimap-panel {
+  position: absolute;
+  left: 12px;
+  bottom: 132px;
+  z-index: 1;
+  width: 208px;
+  background: rgba(15, 23, 42, 0.85);
+  border-radius: 8px;
+  padding: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#minimap {
+  display: block;
+  width: 192px;
+  height: 150px;
+}
+
+/* Basemap + relief, kept with the inset rather than in the race-config modal:
+ * these change the view immediately and have nothing to do with what is being
+ * raced, so putting them behind "Apply & Restart" would be wrong. */
+#map-view-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+#basemap-select {
+  font: inherit;
+  font-size: 11px;
+  background: #0f172a;
+  color: #cbd5e1;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 2px 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+#relief-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #94a3b8;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#relief-exaggeration {
+  width: 100%;
+  accent-color: #3b82f6;
+}
+
+/* The curvature gradient on the route line is the map's densest piece of
+ * information and had nothing anywhere explaining it. */
+#curvature-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 6px;
+}
+
+.legend-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #94a3b8;
+}
+
+/* Same five stops as curvatureColor() in map.ts, in the same order. */
+.legend-scale {
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(to right, #dc2626, #f97316, #eab308, #84cc16, #3b82f6);
+}
+
+.legend-ends {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: #64748b;
+}
+
+@media (max-height: 720px) {
+  /* Short windows: the inset would collide with the HUD. */
+  #minimap-panel {
+    display: none;
+  }
 }
