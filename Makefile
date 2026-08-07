@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install dev run build preview test typecheck check bake sim-batch clean
+.PHONY: help install dev run build preview test typecheck check bake bake-meshes sim-batch clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -29,6 +29,10 @@ check: typecheck test ## Type-check and run tests
 
 bake: ## Bake a route: make bake ARGS='--from "Origin, ST" --to "Destination, ST" --slug my-route-slug'
 	npm run bake -- $(ARGS)
+
+
+bake-meshes: ## Re-bake the 3D vehicle models from assets/vehicles into public/models
+	npm run bake-meshes
 
 
 sim-batch: ## Run headless batch validation: make sim-batch ARGS='--route sorocaba-campos --seeds 30'

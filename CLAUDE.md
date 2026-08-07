@@ -18,6 +18,8 @@ make typecheck    # tsc --noEmit
 make test         # vitest run
 make bake ARGS='--from "Origin, ST" --to "Destination, ST" --slug my-route-slug'
                    # bake a new route from OSM data (add --alternatives for route variants)
+make bake-meshes  # re-bake the 3D vehicle models (assets/vehicles/*.glb -> public/models/*.mesh);
+                   # only needed after changing a source model or the bake tool
 make sim-batch ARGS='--route sorocaba-campos --seeds 30'
                    # headless N-seed batch validation (incident/retirement rates) — see REALISM-GUIDE.md §0.4
                    # Runs seeds across worker threads (~4x faster); add --jobs 1 to run inline when debugging,
@@ -60,6 +62,8 @@ Vanilla DOM, no framework. `map.ts` wraps MapLibre (per-route-slug sources/layer
 **Map layers** (`map.ts`) are, bottom to top: route casing (one colour per variant in play) → curvature gradient → caution zones → start/finish + 10 km markers → incident sites → car circles → deck.gl models. Anything the app owns is added by `addAppLayers`, which runs both at first load *and* after every basemap swap — `setStyle` discards every source and layer, so a second copy of that logic would drift. Two traps worth knowing: a `zoom` expression is only legal at the **top level** of a paint property (nest one inside a `case` and MapLibre drops the whole layer, logging to the console and rendering nothing — it looks exactly like a layer that was never added), and starting a style swap while one is in flight upsets MapLibre's symbol buckets, which is why `setBasemap` returns a promise the caller uses to disable the control.
 
 `minimap.ts` draws the route overview inset on a 2D canvas rather than a second MapLibre instance — a second GL context and tile pipeline to draw a polyline and a dozen dots would be absurd, and `profile.ts` already proves the approach.
+
+**Vehicle models.** `public/models/{car,motorcycle}.mesh` are baked from CC0 glTF sources in `assets/vehicles/` by `tools/bake-vehicle-mesh.ts`; `cars-3d.ts` fetches them at startup and falls back to the generated `car-mesh.ts`/`bike-mesh.ts` shapes until they arrive (or for good, if they 404). The bake flattens the glTF scene graph, applies node transforms, and converts the source texture/material colours into a per-vertex **luminance multiplier** — because deck.gl multiplies COLOR_0 by the per-instance livery colour, and a car has to come out in *its own* colour rather than the model's. Two things that will bite anyone editing that tool, both learned the hard way and both commented in it: the texture V coordinate needs flipping (unflipped, every vertex samples the atlas's grey band), and the normalisation reference must be the brightest *large* surface — brightest-overall lets a ten-vertex headlamp darken a whole motorcycle, largest-overall lets window glass blow out a whole car.
 
 `chase-camera.ts` owns pitch and bearing; `tv-camera.ts` is the broadcast mode, which cuts between framings on a fixed (not random) shot cycle so a replayed seed looks the same twice.
 

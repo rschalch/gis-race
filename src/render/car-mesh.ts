@@ -1,10 +1,15 @@
 /**
- * A low-poly car, generated rather than loaded.
+ * A low-poly car, generated rather than loaded — now the **fallback**.
  *
- * Deliberately not a glTF asset: a file would mean sourcing a model with a
- * compatible licence, committing a binary, and pulling in @loaders.gl/gltf to
- * parse it. `mesh` in cars-3d.ts is a single value to swap when a real model is
- * worth the dependency.
+ * Real models (Kenney's CC0 Car Kit, baked by `npm run bake-meshes`) are
+ * fetched at startup and replace this the moment they arrive; see
+ * `loadBakedMeshes` in cars-3d.ts. This still runs on the first frames, and
+ * still renders the race if `public/models/*.mesh` is missing or fails to
+ * load, so a network hiccup costs fidelity rather than the whole map.
+ *
+ * It is also the reference for the format the bake targets: same attributes,
+ * same axes, and the same rule that COLOR_0 is a *multiplier* on the vehicle's
+ * livery rather than a colour of its own.
  *
  * Two things drive the shape, both learned from looking at it on the map:
  *
@@ -29,7 +34,10 @@ export interface CarMeshData {
     NORMAL: { value: Float32Array; size: 3 };
     COLOR_0: { value: Float32Array; size: 3 };
   };
-  indices: { value: Uint16Array; size: 1 };
+  // Uint32 as well as Uint16: the baked models run past 65 535 indices, and
+  // WebGL2 (which the interleaved deck.gl overlay already requires) takes
+  // 32-bit index buffers natively.
+  indices: { value: Uint16Array | Uint32Array; size: 1 };
 }
 
 export type Point2 = [number, number];

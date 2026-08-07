@@ -1,7 +1,7 @@
 import { MapboxOverlay } from '@deck.gl/mapbox';
 import { SimpleMeshLayer } from '@deck.gl/mesh-layers';
 import type { Map as MapLibreMap } from 'maplibre-gl';
-import { buildCarMesh } from './car-mesh';
+import { buildCarMesh, type CarMeshData } from './car-mesh';
 import { buildMotorcycleMesh } from './bike-mesh';
 import type { VehicleType } from '../types';
 
@@ -17,10 +17,74 @@ import type { VehicleType } from '../types';
  * that v6 removed, and throws on every frame there. See the pin note in map.ts.
  */
 
-const CAR_MESH = buildCarMesh();
-const BIKE_MESH = buildMotorcycleMesh();
 const CARS_LAYER_ID = 'cars-3d';
 const BIKES_LAYER_ID = 'bikes-3d';
+
+/**
+ * The meshes actually drawn.
+ *
+ * They start as the generated fallbacks (car-mesh.ts / bike-mesh.ts) and are
+ * replaced in place once the baked models load — see loadBakedMeshes. Mutable
+ * module state rather than a prop because the layer is rebuilt every frame
+ * anyway: the next frame after the swap simply constructs its
+ * SimpleMeshLayer with the new mesh, and deck.gl reuploads the geometry once.
+ */
+let carMesh: CarMeshData = buildCarMesh();
+let bikeMesh: CarMeshData = buildMotorcycleMesh();
+
+/**
+ * Reads a mesh baked by `tools/bake-vehicle-mesh.ts`.
+ *
+ * The format is deliberately trivial — a 16-byte header then three float
+ * blocks and an index block — so this is four typed-array *views* over the
+ * response buffer with no copying and no parsing. Anything unexpected returns
+ * null and leaves the fallback in place; a vehicle model is not worth throwing
+ * away the race for.
+ */
+const BAKED_MESH_MAGIC = 'GRMESH1\0';
+
+async function loadBakedMesh(url: string): Promise<CarMeshData | null> {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength < 16) return null;
+    if (new TextDecoder().decode(new Uint8Array(buffer, 0, 8)) !== BAKED_MESH_MAGIC) return null;
+
+    const header = new DataView(buffer);
+    const vertexCount = header.getUint32(8, true);
+    const indexCount = header.getUint32(12, true);
+    const floats = vertexCount * 3;
+    const expected = 16 + floats * 4 * 3 + indexCount * 4;
+    if (buffer.byteLength !== expected) return null;
+
+    return {
+      attributes: {
+        POSITION: { value: new Float32Array(buffer, 16, floats), size: 3 },
+        NORMAL: { value: new Float32Array(buffer, 16 + floats * 4, floats), size: 3 },
+        COLOR_0: { value: new Float32Array(buffer, 16 + floats * 8, floats), size: 3 },
+      },
+      indices: { value: new Uint32Array(buffer, 16 + floats * 12, indexCount), size: 1 },
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Kicked off once, on the first overlay creation. A basemap swap rebuilds the
+ * overlay but must not re-fetch. */
+let bakedMeshesRequested = false;
+
+function loadBakedMeshes(): void {
+  if (bakedMeshesRequested) return;
+  bakedMeshesRequested = true;
+  void loadBakedMesh('/models/car.mesh').then((mesh) => {
+    if (mesh) carMesh = mesh;
+  });
+  void loadBakedMesh('/models/motorcycle.mesh').then((mesh) => {
+    if (mesh) bikeMesh = mesh;
+  });
+}
 
 /** Nose-to-tail length of the mesh in car-mesh.ts, metres. */
 const CAR_LENGTH_M = 4.2;
@@ -181,6 +245,7 @@ export function resetModelCulling(map: MapLibreMap): void {
 }
 
 export function createCarOverlay(map: MapLibreMap): MapboxOverlay {
+  loadBakedMeshes();
   const overlay = new MapboxOverlay({ interleaved: true, layers: [] });
   map.addControl(overlay);
   // Dev-only handle, same reasoning as __map in map.ts: deck.gl groups its
@@ -263,7 +328,7 @@ export function updateCars3D(
   // same size as one.
   const partition = (type: VehicleType): Car3D[] => cars.filter((c) => c.type === type);
 
-  const layerFor = (id: string, mesh: typeof CAR_MESH, data: Car3D[]) =>
+  const layerFor = (id: string, mesh: CarMeshData, data: Car3D[]) =>
     new SimpleMeshLayer<Car3D>({
       id,
       data,
@@ -288,8 +353,8 @@ export function updateCars3D(
 
   overlay.setProps({
     layers: [
-      layerFor(CARS_LAYER_ID, CAR_MESH, partition('car')),
-      layerFor(BIKES_LAYER_ID, BIKE_MESH, partition('motorcycle')),
+      layerFor(CARS_LAYER_ID, carMesh, partition('car')),
+      layerFor(BIKES_LAYER_ID, bikeMesh, partition('motorcycle')),
     ],
   });
 }
