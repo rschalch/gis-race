@@ -55,6 +55,11 @@ export function assertRoute(value: unknown, slug: string): asserts value is Rout
   // structure only when present. Scanned in full for the same reason as the
   // points above: one bad coordinate mid-array draws a line across the map to
   // (NaN, NaN) and silently drops the rest of the road.
+  if (route.turnaroundS !== undefined) {
+    if (!Number.isFinite(route.turnaroundS) || route.turnaroundS <= 0 || route.turnaroundS >= route.totalDistance) {
+      fail('turnaroundS must be a finite distance strictly inside the route');
+    }
+  }
   if (route.shape !== undefined) {
     if (!Array.isArray(route.shape) || route.shape.length < 2) fail('shape must be an array of at least 2 coordinates');
     for (let i = 0; i < route.shape.length; i++) {
@@ -160,7 +165,11 @@ export const CAR_HEADING_WINDOW_M = 30;
  * Derived purely from baked geometry for *rendering* — exactly like lon/lat
  * in interpolateAt, and subject to the same rule: this is not simulation
  * state, and nothing in sim.ts/driver.ts/physics.ts may read it. The sim
- * stays one-dimensional (§0 ground rules).
+ * stays one-dimensional (§0 ground rules). (R16's wind reads road bearing
+ * too, but as a per-point route *property* via pointBearingsRad below —
+ * like grade or radius, an input the 1D sim samples at `s`, never car
+ * state. This function stays render-only: its centred smoothing window is
+ * a camera nicety, not geometry.)
  */
 export function headingAt(route: Route, s: number, windowM: number = CAMERA_HEADING_WINDOW_M): number {
   // CENTRED on s — half the window behind, half ahead. This originally sampled
@@ -191,6 +200,33 @@ export function headingAt(route: Route, s: number, windowM: number = CAMERA_HEAD
   const dy = b.lat - a.lat;
   if (dx === 0 && dy === 0) return 0;
   return (Math.atan2(dx, dy) * 180) / Math.PI;
+}
+
+/**
+ * R16: per-point road bearing in radians (0 = north, clockwise), one entry
+ * per route point — the segment direction from each point to the next, last
+ * point repeating its predecessor.
+ *
+ * This is the physics-facing sibling of headingAt: bearing consumed as a
+ * per-point route *property* (like grade or radius) so the sim can project
+ * a race-level wind vector onto the road. Computed once per route — callers
+ * cache the result (createSim does) rather than re-deriving per step. The
+ * sim still holds no heading state; it samples this exactly the way it
+ * samples grade.
+ */
+export function pointBearingsRad(route: Route): Float64Array {
+  const n = route.points.length;
+  const bearings = new Float64Array(n);
+  for (let i = 0; i < n - 1; i++) {
+    const a = route.points[i]!;
+    const b = route.points[i + 1]!;
+    const meanLat = (((a.lat + b.lat) / 2) * Math.PI) / 180;
+    const dx = (b.lon - a.lon) * Math.cos(meanLat);
+    const dy = b.lat - a.lat;
+    bearings[i] = dx === 0 && dy === 0 ? (i > 0 ? bearings[i - 1]! : 0) : Math.atan2(dx, dy);
+  }
+  if (n > 1) bearings[n - 1] = bearings[n - 2]!;
+  return bearings;
 }
 
 /**

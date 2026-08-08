@@ -452,6 +452,10 @@ describe('R5: a committed pass costs cornering margin', () => {
       rng: () => 0.999, // never trips the crash roll — this test reads the returned U
       seed: 1,
       tireWear: 0,
+      engineLoad: 0,
+      brakeHeat: 0,
+    pauseRemaining: 0,
+    turnaroundTaken: false,
       condition: { grip: 1, cdA: 1 },
       ...overrides,
     };
@@ -490,6 +494,10 @@ describe('evaluateLossOfControl', () => {
       rng: mulberry32(1),
       seed: 1,
       tireWear: 0,
+      engineLoad: 0,
+      brakeHeat: 0,
+    pauseRemaining: 0,
+    turnaroundTaken: false,
       condition: { grip: 1, cdA: 1 },
       ...overrides,
     };
@@ -553,6 +561,10 @@ describe('R12: persistent incident damage', () => {
       rng: () => 0, // forces any above-threshold incident to actually fire
       seed: 1,
       tireWear: 0,
+      engineLoad: 0,
+      brakeHeat: 0,
+    pauseRemaining: 0,
+    turnaroundTaken: false,
       condition: { grip: 1, cdA: 1 },
       ...overrides,
     };

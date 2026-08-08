@@ -1,7 +1,7 @@
-import type { CarSpec, CarState, CarStatus, Incident, RaceEvent, Route, Weather } from './types';
+import type { CarSpec, CarState, CarStatus, Incident, RaceEvent, Route, Weather, WindPreset } from './types';
 import { computeAcceleration } from './physics';
-import { interpolateAt, radiusAt } from './route';
-import { computeSpeedProfile, driverControl, evaluateLossOfControl } from './driver';
+import { interpolateAt, radiusAt, pointBearingsRad } from './route';
+import { computeSpeedProfile, driverControl, evaluateLossOfControl, brakeFadeFactor } from './driver';
 import { mulberry32 } from './rng';
 import {
   DRAFT_MAX_GAP_M,
@@ -27,6 +27,12 @@ import {
   RELIABILITY_BASE_PER_S,
   RELIABILITY_LOAD_PER_S,
   MECHANICAL_COAST_BRAKE,
+  ENGINE_LOAD_TAU_S,
+  ENGINE_LOAD_NEUTRAL,
+  ENGINE_STRESS_MULT,
+  BRAKE_HEAT_TAU_S,
+  BRAKE_HEAT_SPEED_REF,
+  WIND_PRESET_SPEED,
 } from './tuning';
 
 const DT = 1 / 60;
@@ -98,6 +104,26 @@ export interface Sim {
   // R7: race-level condition, fixed for the whole race — see tuning.ts's
   // WEATHER_GRIP/WEATHER_ERROR_MULT.
   weather: Weather;
+  /**
+   * Seconds every car waits at a there-and-back course's turnaround
+   * (`route.turnaroundS`). A race setting rather than baked into the route, so
+   * it can be changed without re-baking — a bake is minutes of rate-limited
+   * elevation fetching, and "how long is the stop" is exactly the kind of
+   * thing worth trying three values of.
+   *
+   * 0, and on a one-way route, means nothing happens at all.
+   */
+  turnaroundPauseS: number;
+  /** R16: race-level wind — the preset the race was configured with, its
+   * speed in m/s, and the compass direction (radians) drawn from the race
+   * seed. One vector for the whole race; the road turns under it. */
+  wind: WindPreset;
+  windSpeed: number;
+  windDirRad: number;
+  /** R16: per-route, per-point tailwind component (m/s, positive = pushing)
+   * — windSpeed × cos(dir − bearing), precomputed once at createSim so the
+   * per-step cost is one array read, like the speed profile. */
+  windAlongByRoute: Map<Route, Float64Array>;
 }
 
 // FNV-1a — cheap, well-distributed string hash.
@@ -123,6 +149,16 @@ function deriveCarSeed(raceSeed: number, carId: string): number {
   return (h ^ (h >>> 16)) >>> 0;
 }
 
+/** R16: the race's wind direction (radians, same compass convention as
+ * pointBearingsRad), drawn from a throwaway PRNG stream keyed off the race
+ * seed — deliberately NOT car.rng (§0.1: it would shift every car's draw
+ * stream) and not an extra config knob (a direction picker is more UI than
+ * the feature is worth; reroll the seed, reroll the wind). Exported for
+ * tests. */
+export function windDirectionRad(raceSeed: number): number {
+  return mulberry32((raceSeed ^ 0x77696e64) >>> 0)() * 2 * Math.PI; // 0x77696e64 = 'wind'
+}
+
 export function createSim(
   assignments: CarAssignment[],
   raceSeed = 1,
@@ -133,6 +169,8 @@ export function createSim(
   // every caller. main.ts passes the configured value; unit tests that place
   // cars relative to each other get an unstaggered field for free.
   startIntervalS = 0,
+  turnaroundPauseS = 0,
+  wind: WindPreset = 'calm',
 ): Sim {
   const cars: CarState[] = assignments.map(({ spec, route }, index) => {
     const seed = deriveCarSeed(raceSeed, spec.id);
@@ -159,7 +197,11 @@ export function createSim(
       rng: mulberry32(seed),
       seed,
       tireWear: 0,
+      engineLoad: 0,
+      brakeHeat: 0,
       condition: { grip: 1, cdA: 1 },
+      pauseRemaining: 0,
+      turnaroundTaken: false,
     };
   });
 
@@ -172,6 +214,21 @@ export function createSim(
     v: car.v,
     status: car.status,
   }));
+
+  // R16: one wind vector per race, projected onto each distinct route's
+  // per-point bearings once — stepCar then pays one array read per step.
+  const windSpeed = WIND_PRESET_SPEED[wind];
+  const windDirRad = windDirectionRad(raceSeed);
+  const windAlongByRoute = new Map<Route, Float64Array>();
+  if (windSpeed > 0) {
+    for (const { route } of assignments) {
+      if (windAlongByRoute.has(route)) continue;
+      const bearings = pointBearingsRad(route);
+      const along = new Float64Array(bearings.length);
+      for (let i = 0; i < bearings.length; i++) along[i] = windSpeed * Math.cos(windDirRad - bearings[i]!);
+      windAlongByRoute.set(route, along);
+    }
+  }
 
   return {
     cars,
@@ -187,6 +244,11 @@ export function createSim(
     hazards: [],
     overtakeCooldowns: new Map(),
     weather,
+    turnaroundPauseS,
+    wind,
+    windSpeed,
+    windDirRad,
+    windAlongByRoute,
   };
 }
 
@@ -326,6 +388,8 @@ interface StepContext {
   events: RaceEvent[];
   overtakeCooldowns: Map<string, number>;
   weather: Weather;
+  turnaroundPauseS: number;
+  windAlongByRoute: Map<Route, Float64Array>; // R16: empty map when calm
   onIncident?: (car: CarState, incident: Incident) => void;
 }
 
@@ -336,8 +400,12 @@ function overtakePairKey(idA: string, idB: string): string {
 // R13: hazard rate for mechanical failure — exported for direct testing of
 // the analytic law (§0.4-style: expected failures over N draws vs. this
 // formula), separate from the Monte-Carlo full-race batch check.
-export function reliabilityHazardRate(throttle: number): number {
-  return RELIABILITY_BASE_PER_S + RELIABILITY_LOAD_PER_S * throttle;
+// R15: the load term scales with smoothed engine load — a machine held near
+// wide open for minutes on end is progressively more likely to let go than
+// one that just opened up. No penalty at or below ENGINE_LOAD_NEUTRAL.
+export function reliabilityHazardRate(throttle: number, engineLoad: number): number {
+  const stress = Math.max(0, engineLoad - ENGINE_LOAD_NEUTRAL) / (1 - ENGINE_LOAD_NEUTRAL);
+  return RELIABILITY_BASE_PER_S + RELIABILITY_LOAD_PER_S * throttle * (1 + ENGINE_STRESS_MULT * stress);
 }
 
 // R13: a mechanically-retired car that hasn't yet reached v=0 keeps
@@ -374,6 +442,17 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
     return;
   }
 
+  if (car.status === 'paused') {
+    // No physics at all: the car is stationary at the turnaround by
+    // arrangement, not by dynamics.
+    car.pauseRemaining = Math.max(0, car.pauseRemaining - dt);
+    if (car.pauseRemaining === 0) {
+      car.status = 'racing';
+      car.v = 0;
+    }
+    return;
+  }
+
   if (car.status === 'spinning') {
     // §7.5 Step 5: skip physics entirely while spinning.
     car.recoveryRemaining = Math.max(0, car.recoveryRemaining - dt);
@@ -381,6 +460,26 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
       car.status = 'racing';
       car.v = 0;
     }
+    return;
+  }
+
+  // The scheduled stop at a there-and-back turnaround. Checked before this
+  // step's physics so the car halts *at* the mark rather than a step past it,
+  // and gated on `turnaroundTaken` because `s` stays beyond the mark for the
+  // whole return leg.
+  if (
+    car.route.turnaroundS !== undefined &&
+    !car.turnaroundTaken &&
+    car.s >= car.route.turnaroundS &&
+    ctx.turnaroundPauseS > 0
+  ) {
+    car.turnaroundTaken = true;
+    car.status = 'paused';
+    car.v = 0;
+    car.throttle = 0;
+    car.brake = 0;
+    car.pauseRemaining = ctx.turnaroundPauseS;
+    ctx.events.push({ time: simTime, type: 'turnaround', carId: car.spec.id, data: { pauseS: ctx.turnaroundPauseS } });
     return;
   }
 
@@ -400,6 +499,9 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
   // R1's lookahead (which only reasons about the speed profile, not the
   // world) would otherwise command.
   const speedCap = cautionCapAt(ctx.hazards, car.route, car.s);
+  // R19: the controller and physics read the same faded-brake factor,
+  // computed from start-of-step heat (one-step lag, deterministic).
+  const brakeFade = brakeFadeFactor(car.brakeHeat);
   const { throttle, brake } = driverControl(
     car.speedProfile,
     car.route,
@@ -410,9 +512,19 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
     ctx.weather,
     speedCap,
     conditionGrip,
+    brakeFade,
   );
   car.throttle = throttleLockedOut ? 0 : throttle;
   car.brake = brake;
+
+  // R15: smoothed engine load, updated from this step's commanded throttle
+  // before the reliability draw reads it. Pure state, no rng — safe here
+  // without disturbing the §0.1 draw layout.
+  car.engineLoad += ((car.throttle - car.engineLoad) * dt) / ENGINE_LOAD_TAU_S;
+  // R19: brake heat — energy in scales with pedal × speed (a stop from
+  // motorway speed heats what a town stop does not).
+  const brakeEnergySignal = car.brake * Math.min(1, car.v / BRAKE_HEAT_SPEED_REF);
+  car.brakeHeat += ((brakeEnergySignal - car.brakeHeat) * dt) / BRAKE_HEAT_TAU_S;
 
   // R13: mechanical reliability — drawn every step, unconditionally, for
   // every currently-racing car regardless of throttle magnitude (§0.1: an
@@ -420,7 +532,7 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
   // throttle history). On failure, override this step's own throttle/brake
   // so the physics below already reflects a dead engine + easing off,
   // rather than needing a separate code path for the first failed step.
-  const hazardRate = reliabilityHazardRate(car.throttle);
+  const hazardRate = reliabilityHazardRate(car.throttle, car.engineLoad);
   const pFailureThisStep = 1 - Math.exp(-hazardRate * dt);
   const mechanicalFailure = car.rng() < pFailureThisStep;
 
@@ -447,6 +559,13 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
     : 1;
 
   const { grade, ele, surface } = interpolateAt(car.route, car.s);
+  // R16: tailwind component at this point of road (0 in calm races, where
+  // the map is empty). Piecewise-constant per 25 m point — wind does not
+  // need interpolation.
+  const windAlongArr = ctx.windAlongByRoute.get(car.route);
+  const windAlongHere = windAlongArr
+    ? windAlongArr[Math.min(Math.floor(car.s / car.route.spacing), windAlongArr.length - 1)]!
+    : 0;
   // R7/R8/R11/R12: weather × surface × condition grip scalar, same one
   // driverControl/evaluateLossOfControl use — plan, runtime, and crash
   // check all read off the same effective grip.
@@ -461,6 +580,10 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
     ele,
     gripMultiplier,
     conditionCdA: car.condition.cdA,
+    surface,
+    engineLoad: car.engineLoad,
+    brakeFade,
+    windAlong: windAlongHere,
   });
 
   // §6.2: semi-implicit Euler — update v first, then s.
@@ -519,11 +642,17 @@ function stepCar(car: CarState, simTime: number, dt: number, ctx: StepContext): 
           car.heldUpFor = 0;
         }
       }
-      if (car.passRemaining === 0 && blockLeader.v < car.v) {
-        const projectedGap = blockLeader.s - (car.s + car.v * dt);
-        if (projectedGap < BLOCK_MIN_GAP_M) {
-          car.v = blockLeader.v * BLOCK_FOLLOW_FACTOR;
-        }
+    }
+    // The gap clamp reads *actual* speeds, outside the patience gate above:
+    // desiredSpeed can sit at or below the leader's v (profile noise, the
+    // leader briefly accelerating, braking down from a faster section) while
+    // the follower still carries more real speed — patience should reset
+    // then, but on road too tight to pass the car must not close through
+    // BLOCK_MIN_GAP_M and drive over the one ahead.
+    if (radius <= PASS_MIN_RADIUS_M && car.passRemaining === 0 && blockLeader.v < car.v) {
+      const projectedGap = blockLeader.s - (car.s + car.v * dt);
+      if (projectedGap < BLOCK_MIN_GAP_M) {
+        car.v = blockLeader.v * BLOCK_FOLLOW_FACTOR;
       }
     }
   } else {
@@ -619,6 +748,8 @@ export function tick(sim: Sim, realDeltaSeconds: number): void {
     events: sim.events,
     overtakeCooldowns: sim.overtakeCooldowns,
     weather: sim.weather,
+    turnaroundPauseS: sim.turnaroundPauseS,
+    windAlongByRoute: sim.windAlongByRoute,
     onIncident: onCarIncident,
   };
 
@@ -661,6 +792,8 @@ export function tick(sim: Sim, realDeltaSeconds: number): void {
   // stop) — the race isn't over while one is still visibly rolling. A staged
   // car has not even started, so it also keeps the race alive (its status is
   // neither of the two terminal ones, so this is already handled).
+  // A paused car is neither finished nor retired, so it already keeps the race
+  // alive through this check — same as a staged one.
   if (sim.cars.every((c) => c.status === 'finished' || (c.status === 'retired' && c.v === 0))) {
     sim.raceOver = true;
     sim.paused = true;

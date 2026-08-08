@@ -699,6 +699,65 @@ body {
   opacity: 0.6;
 }
 
+/* A stop row is the From/To field plus a remove button. The label spans both
+   columns so the input still lines up with the endpoint fields above it. */
+.config-via-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: 6px;
+  align-items: center;
+}
+
+.config-via-row label {
+  grid-column: 1 / -1;
+}
+
+/* Match the input, not the row — the button sits outside it. */
+.config-via-row .autocomplete-suggestions {
+  right: 28px;
+}
+
+.config-via-remove {
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  width: 22px;
+  height: 26px;
+  padding: 0;
+  background: transparent;
+  color: #94a3b8;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.config-via-remove:hover:not(:disabled) {
+  color: #f87171;
+  border-color: #f87171;
+}
+
+.config-add-via {
+  font: inherit;
+  font-size: 12px;
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: transparent;
+  color: #7dd3fc;
+  border: 1px dashed #334155;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.config-add-via:hover:not(:disabled) {
+  border-color: #7dd3fc;
+}
+
+.config-add-via:disabled,
+.config-via-remove:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .autocomplete-suggestions {
   position: absolute;
   left: 0;
@@ -1725,4 +1784,24 @@ body {
   #minimap-panel {
     display: none;
   }
+}
+
+/* Coordinate rows in the route-creation autocomplete: the affirmative one is
+ * an action, the error one is not selectable and says so by looking inert. */
+.autocomplete-suggestions .autocomplete-coords {
+  color: #93c5fd;
+  font-variant-numeric: tabular-nums;
+}
+
+.autocomplete-suggestions .autocomplete-error {
+  color: #f87171;
+  cursor: default;
+}
+
+.config-new-course-intro code {
+  font-size: 11px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 3px;
+  padding: 0 3px;
 }

@@ -39,7 +39,14 @@ import type { CarState, Route } from './types';
 
 // Recorded on this engine version. Bumping ENGINE_VERSION without re-recording
 // the values below is exactly the mistake this pairing is here to catch.
-const GOLDEN_ENGINE_VERSION = 5;
+// (v5 → v6 re-recorded nothing: the golden race has no tight-road blocking
+// moment where the v6 clamp-gate fix bites, so its constants are unchanged.
+// v6 → v7 likewise: R15 raises per-step failure probabilities by parts in a
+// million, and no draw in this short race lands inside the shifted band.
+// v7 → v8 re-recorded everything below: R18's driveline launch loss slows
+// every getaway, and R17's surface rolling resistance touches the fixture's
+// 0.8-surface stretch.)
+const GOLDEN_ENGINE_VERSION = 8;
 
 /** A deliberately varied fixture: straights, a tight section, gradient, a
  * surface change and a speed-limit zone, so the golden exercises the corner
@@ -131,14 +138,14 @@ describe('golden race (§0.1 determinism)', () => {
     // JS engines and platforms — but any real change to sim behaviour moves
     // these by whole seconds, not by 1e-12.
     const byId = new Map(actual.cars.map((c) => [c.id, c]));
-    expect(byId.get('alpha')!.finishTime!).toBeCloseTo(318.4666666667057, 3);
-    expect(byId.get('bravo')!.finishTime!).toBeCloseTo(343.549999999998, 3);
-    expect(byId.get('charlie')!.finishTime!).toBeCloseTo(330.4333333333251, 3);
-    expect(actual.simTime).toBeCloseTo(370.4333333333251, 3);
+    expect(byId.get('alpha')!.finishTime!).toBeCloseTo(319.85000000003777, 3);
+    expect(byId.get('bravo')!.finishTime!).toBeCloseTo(344.88333333333014, 3);
+    expect(byId.get('charlie')!.finishTime!).toBeCloseTo(334.7666666666545, 3);
+    expect(actual.simTime).toBeCloseTo(374.7666666666545, 3);
 
-    expect(byId.get('alpha')!.tireWear).toBeCloseTo(0.03575905942712653, 6);
-    expect(byId.get('bravo')!.tireWear).toBeCloseTo(0.03206836824357173, 6);
-    expect(byId.get('charlie')!.tireWear).toBeCloseTo(0.032521764289219025, 6);
+    expect(byId.get('alpha')!.tireWear).toBeCloseTo(0.034893273097778184, 6);
+    expect(byId.get('bravo')!.tireWear).toBeCloseTo(0.03113701677183978, 6);
+    expect(byId.get('charlie')!.tireWear).toBeCloseTo(0.03168524141532022, 6);
   });
 
   // The race above deliberately contains no incidents, and that is not an
@@ -178,6 +185,10 @@ describe('golden race (§0.1 determinism)', () => {
         rng: () => 0,
         seed: 1,
         tireWear: 0,
+        engineLoad: 0,
+        brakeHeat: 0,
+    pauseRemaining: 0,
+    turnaroundTaken: false,
         condition: { grip: 1, cdA: 1 },
       };
       const u = evaluateLossOfControl(car, route, 0, 0, 1 / 60, 'dry');

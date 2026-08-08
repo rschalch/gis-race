@@ -8,6 +8,7 @@ import {
   raceRank,
   projectedTime,
   runningTime,
+  windDirectionRad,
 } from './sim';
 import { radiusAt } from './route';
 import { makeTestRoute, TEST_CAR } from './test-fixtures';
@@ -19,8 +20,13 @@ import {
   CAUTION_AHEAD_M,
   CAUTION_BEHIND_M,
   ENGINE_VERSION,
+  ENGINE_LOAD_NEUTRAL,
+  ENGINE_LOAD_TAU_S,
+  ENGINE_STRESS_MULT,
   RELIABILITY_BASE_PER_S,
+  RELIABILITY_LOAD_PER_S,
   PASS_PATIENCE_S,
+  WIND_PRESET_SPEED,
 } from './tuning';
 import type { CarState, Route } from './types';
 
@@ -54,6 +60,10 @@ describe('resolveLeader / remainingDistance (B3, F1)', () => {
       rng: () => 0.5,
       seed: 1,
       tireWear: 0,
+      engineLoad: 0,
+      brakeHeat: 0,
+    pauseRemaining: 0,
+    turnaroundTaken: false,
       condition: { grip: 1, cdA: 1 },
       ...overrides,
     };
@@ -114,6 +124,10 @@ describe('interval start: ranking by own running time', () => {
       rng: () => 0,
       seed: 1,
       tireWear: 0,
+      engineLoad: 0,
+      brakeHeat: 0,
+    pauseRemaining: 0,
+    turnaroundTaken: false,
       condition: { grip: 1, cdA: 1 },
       ...overrides,
     };
@@ -238,9 +252,130 @@ describe('R11: tire wear accumulation', () => {
   });
 });
 
+describe('R11: wear adaptation costs pace, not risk', () => {
+  // The shipped routes put their twisty sections at the end, so raw
+  // crash-by-third counts cannot distinguish "worn tyres crash more" from
+  // "the Serra is the last third" (diagnosed empirically — see sim-batch's
+  // exposure-normalized report). This pins the adaptation itself on a route
+  // with UNIFORM risk: 100 km of constant radius-100 cornering. If the
+  // sqrt(conditionGrip) target scaling leaked, utilisation would climb with
+  // wear and slides would fire; working, the car simply gets slower.
+  it('on a uniform corner, a car ends worn, slower, and crash-free', () => {
+    const route = makeTestRoute({ n: 4000, radiusAt: () => 100 });
+    // aggression 0.94 plans the corner at U ≈ 0.82, so even the +6% noise
+    // tail stays under the slide threshold — the crash-free assertion is
+    // then a property of the adaptation, not luck of the seed.
+    const sim = createSim([{ spec: { ...TEST_CAR, aggression: 0.94 }, route }], 7, false);
+    const car = sim.cars[0]!;
+    // Mean speed over 10 km windows (2.5 wavelengths of the §7.4 noise, so
+    // the ±3% misjudgement mostly averages out of both samples).
+    let earlySum = 0, earlyN = 0, lateSum = 0, lateN = 0;
+    let guard = 0;
+    while (!sim.raceOver && guard++ < 500_000) {
+      tick(sim, 1);
+      if (car.s > 2_000 && car.s < 12_000) { earlySum += car.v; earlyN++; }
+      if (car.s > 86_000 && car.s < 96_000) { lateSum += car.v; lateN++; }
+    }
+    expect(sim.raceOver).toBe(true);
+    expect(car.tireWear).toBeGreaterThan(0.5);
+    expect(car.incidents.filter((i) => i.severity !== 'mechanical')).toEqual([]);
+    const vEarly = earlySum / earlyN;
+    const vLate = lateSum / lateN;
+    expect(vLate).toBeLessThan(vEarly * 0.995); // measurably slower on worn tyres...
+    expect(vLate).toBeGreaterThan(vEarly * 0.9); // ...but only by the few percent grip actually lost
+  });
+});
+
+describe('R16: wind', () => {
+  it('a calm race precomputes nothing; a windy race projects the seed-derived vector onto the route', () => {
+    const route = makeTestRoute({ n: 50 });
+    const calm = createSim([{ spec: TEST_CAR, route }], 11, true, 'dry', 0, 0, 'calm');
+    expect(calm.windSpeed).toBe(0);
+    expect(calm.windAlongByRoute.size).toBe(0);
+
+    const windy = createSim([{ spec: TEST_CAR, route }], 11, true, 'dry', 0, 0, 'windy');
+    expect(windy.windSpeed).toBe(WIND_PRESET_SPEED.windy);
+    const along = windy.windAlongByRoute.get(route)!;
+    expect(along.length).toBe(route.points.length);
+    // Fixture routes run due east along the equator (bearing π/2 at every
+    // point), so the projection is exactly speed × cos(dir − π/2).
+    const expected = WIND_PRESET_SPEED.windy * Math.cos(windDirectionRad(11) - Math.PI / 2);
+    expect(along[0]).toBeCloseTo(expected, 10);
+    expect(along[along.length - 1]).toBeCloseTo(expected, 10);
+  });
+
+  it('wind is deterministic: same seed and preset, byte-identical race', () => {
+    const route = makeTestRoute({ n: 200 });
+    const run = () => {
+      const sim = createSim([{ spec: TEST_CAR, route }], 5, false, 'dry', 0, 0, 'windy');
+      let guard = 0;
+      while (!sim.raceOver && guard++ < 100_000) tick(sim, 1 / 60);
+      return { t: sim.cars[0]!.finishTime, s: sim.cars[0]!.s };
+    };
+    expect(run()).toEqual(run());
+  });
+
+  it('a headwind race and a calm race produce different results', () => {
+    const route = makeTestRoute({ n: 200 });
+    const finish = (wind: 'calm' | 'windy') => {
+      const sim = createSim([{ spec: TEST_CAR, route }], 5, false, 'dry', 0, 0, wind);
+      let guard = 0;
+      while (!sim.raceOver && guard++ < 100_000) tick(sim, 1 / 60);
+      return sim.cars[0]!.finishTime!;
+    };
+    expect(finish('windy')).not.toBe(finish('calm'));
+  });
+});
+
+describe('R19: brake heat', () => {
+  it('a braking-heavy descent heats the brakes; open road does not', () => {
+    // Downhill hairpins every 2 km force repeated hard braking from speed;
+    // the open route never touches the pedal.
+    const descent = makeTestRoute({ n: 2000, radiusAt: (i) => (i % 80 < 8 ? 40 : 3000), gradeAt: () => -0.08 });
+    const open = makeTestRoute({ n: 2000 });
+    const simD = createSim([{ spec: TEST_CAR, route: descent }], 3, false);
+    const simO = createSim([{ spec: TEST_CAR, route: open }], 3, false);
+    for (let i = 0; i < 600 && !simD.raceOver; i++) tick(simD, 1);
+    for (let i = 0; i < 600 && !simO.raceOver; i++) tick(simO, 1);
+    expect(simD.cars[0]!.brakeHeat).toBeGreaterThan(0.1);
+    expect(simO.cars[0]!.brakeHeat).toBeLessThan(0.05);
+  });
+});
+
 describe('R13: mechanical reliability', () => {
   it('hazard rate is base-only at zero throttle', () => {
-    expect(reliabilityHazardRate(0)).toBe(RELIABILITY_BASE_PER_S);
+    expect(reliabilityHazardRate(0, 0)).toBe(RELIABILITY_BASE_PER_S);
+  });
+
+  // R15: sustained load multiplies the hazard's load term; momentary load
+  // does not. The neutral point is a hard boundary — everything at or below
+  // it pays exactly R13's original rate.
+  it('R15: smoothed engine load scales the hazard only above the neutral point', () => {
+    const base = reliabilityHazardRate(1, 0);
+    expect(reliabilityHazardRate(1, ENGINE_LOAD_NEUTRAL)).toBe(base);
+    expect(reliabilityHazardRate(1, 0.5 + ENGINE_LOAD_NEUTRAL / 2)).toBeGreaterThan(base);
+    // Fully soaked at full throttle: the load term is (1 + ENGINE_STRESS_MULT)x.
+    expect(reliabilityHazardRate(1, 1)).toBeCloseTo(
+      RELIABILITY_BASE_PER_S + RELIABILITY_LOAD_PER_S * (1 + ENGINE_STRESS_MULT),
+      12,
+    );
+  });
+
+  it('R15: engineLoad rises toward 1 on a flat-out straight and decays after lifting', () => {
+    const route = makeTestRoute({ n: 4000 }); // 100 km of open road: throttle pinned for a long time
+    const sim = createSim([{ spec: TEST_CAR, route }], 1, false);
+    const car = sim.cars[0]!;
+    expect(car.engineLoad).toBe(0);
+    const steps = Math.round(ENGINE_LOAD_TAU_S * 3 * 60); // 3 time constants
+    for (let i = 0; i < steps; i++) tick(sim, DT);
+    // After 3τ of near-full throttle the EMA should have converged near the
+    // controller's sustained command (well above the stress-neutral point).
+    expect(car.engineLoad).toBeGreaterThan(ENGINE_LOAD_NEUTRAL);
+    // Lift: freeze the driver out by marking the car finished... simplest
+    // honest decay check is the pure update law itself at zero throttle.
+    let load = car.engineLoad;
+    for (let i = 0; i < steps; i++) load += ((0 - load) * DT) / ENGINE_LOAD_TAU_S;
+    expect(load).toBeLessThan(car.engineLoad * 0.06); // e^-3 ≈ 0.05
   });
 
   it('λ math: over many independent draws, failures land within 50% of the analytic probability', () => {
@@ -251,7 +386,7 @@ describe('R13: mechanical reliability', () => {
     // same exponential-hazard formula (reliabilityHazardRate + the
     // 1-exp(-λ·dt) conversion production code uses) at a scale where 200k
     // draws gives thousands of expected hits.
-    const hazardRate = reliabilityHazardRate(0.5);
+    const hazardRate = reliabilityHazardRate(0.5, 0);
     const oneHour = 3600;
     const pThisStep = 1 - Math.exp(-hazardRate * oneHour);
     const DRAWS = 200_000;

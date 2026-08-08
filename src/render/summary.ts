@@ -60,7 +60,12 @@ function describeEvent(event: RaceEvent, nameOf: (carId: string) => string): str
     case 'finish':
       return `${nameOf(event.carId)} finished`;
     // Starts are deliberately not listed: with an interval start there is one
-    // per car and they would swamp everything that actually happened.
+    // per car and they would swamp everything that actually happened. The
+    // turnaround stop is the same shape of event — one per car, all identical
+    // — but it *is* listed, because it is minutes of every finishing time and
+    // a log that hides it makes the results look wrong.
+    case 'turnaround':
+      return `${nameOf(event.carId)} turned around (${Math.round(event.data.pauseS / 60)} min stop)`;
     case 'start':
       return null;
   }

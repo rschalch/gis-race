@@ -1,7 +1,7 @@
-import type { CarSpec, RouteIndexEntry, Weather } from '../types';
+import type { CarSpec, RouteIndexEntry, Weather, WindPreset } from '../types';
 import { CRANK_TO_WHEEL } from '../cars';
 import { carDot } from '../format';
-import { GLOBAL_CAP } from '../tuning';
+import { GLOBAL_CAP, START_INTERVAL_S } from '../tuning';
 import {
   MAX_FIELD_SIZE,
   PERFORMANCE_TIERS,
@@ -22,21 +22,30 @@ export interface ConfigApplyResult {
   carAssignments: Array<{ carId: string; routeSlug: string }>;
   globalCapEnabled: boolean;
   weather: Weather;
+  /** R16: race-level wind preset; direction comes from the race seed. */
+  wind: WindPreset;
   /** Seconds between cars leaving the line; 0 is a mass start. */
   startIntervalS: number;
+  /** Seconds every car waits at a there-and-back course's turnaround. Ignored
+   * on one-way routes, which have no turnaround to wait at. */
+  turnaroundPauseS: number;
 }
 
 /** Interval-start choices. 0 is offered because a mass start is a legitimate
  * format, not because it is the sensible default — with a full grid it puts
- * every car on the same point of road (see START_INTERVAL_S in tuning.ts). */
+ * every car on the same point of road (see START_INTERVAL_S in tuning.ts).
+ * The tuning default is folded in rather than hardcoded: the select marks the
+ * option whose value equals the initial startIntervalS, and a default with no
+ * matching option would silently display (and next Apply, submit) mass start. */
 const START_INTERVAL_CHOICES: ReadonlyArray<{ value: number; label: string }> = [
   { value: 0, label: 'Mass start' },
-  { value: 15, label: 'Interval — 15 s' },
-  { value: 30, label: 'Interval — 30 s' },
-  { value: 60, label: 'Interval — 60 s' },
+  ...[...new Set([15, 30, 60, START_INTERVAL_S])]
+    .sort((a, b) => a - b)
+    .map((value) => ({ value, label: `Interval — ${value} s` })),
 ];
 
 const WEATHER_LABELS: Record<Weather, string> = { dry: 'Dry', damp: 'Damp', wet: 'Wet' };
+const WIND_LABELS: Record<WindPreset, string> = { calm: 'Calm', breezy: 'Breezy', windy: 'Windy' };
 
 export interface ConfigPanelCallbacks {
   onApply: (result: ConfigApplyResult) => void;
@@ -97,6 +106,7 @@ export function initConfigPanel(
   initialGlobalCapEnabled: boolean,
   initialWeather: Weather,
   initialStartIntervalS: number,
+  initialTurnaroundPauseS: number,
   callbacks: ConfigPanelCallbacks,
 ): ConfigPanelHandle {
   panelContainer.innerHTML = `
@@ -162,6 +172,19 @@ export function initConfigPanel(
                 .map((w) => `<option value="${w}" ${w === initialWeather ? 'selected' : ''}>${WEATHER_LABELS[w]}</option>`)
                 .join('')}
             </select>
+          </label>
+          <label class="config-rule" title="One wind for the whole race; its compass direction comes from the race seed. Headwinds add drag, tailwinds shed it — a round trip feels both.">
+            Wind
+            <select class="config-wind">
+              ${(Object.keys(WIND_LABELS) as WindPreset[])
+                .map((w) => `<option value="${w}" ${w === 'calm' ? 'selected' : ''}>${WIND_LABELS[w]}</option>`)
+                .join('')}
+            </select>
+          </label>
+          <label class="config-rule" title="Only applies to there-and-back courses — the stop before heading home. Counts towards every car's finishing time.">
+            Turnaround stop
+            <input type="number" class="config-turnaround-pause" min="0" max="60" step="1" value="0" />
+            <span class="config-hint">min</span>
           </label>
           <label class="config-rule" title="Cars are classified on their own elapsed time, so starting later costs nothing">
             Start
@@ -687,6 +710,11 @@ export function initConfigPanel(
   const globalCapCheckbox = panelContainer.querySelector<HTMLInputElement>('.config-global-cap')!;
   const weatherSelect = panelContainer.querySelector<HTMLSelectElement>('.config-weather')!;
   const startIntervalSelect = panelContainer.querySelector<HTMLSelectElement>('.config-start-interval')!;
+  const windSelect = panelContainer.querySelector<HTMLSelectElement>('.config-wind')!;
+  const turnaroundPauseInput = panelContainer.querySelector<HTMLInputElement>('.config-turnaround-pause')!;
+  // Stored in seconds, typed in minutes — minutes is how you think about a
+  // rest stop, seconds is what the simulation counts in.
+  turnaroundPauseInput.value = String(Math.round(initialTurnaroundPauseS / 60));
 
   function open() {
     panelContainer.hidden = false;
@@ -732,7 +760,9 @@ export function initConfigPanel(
         carAssignments: gridCars().map((car) => ({ carId: car.id, routeSlug: carRouteAssignment.get(car.id)! })),
         globalCapEnabled: globalCapCheckbox.checked,
         weather: weatherSelect.value as Weather,
+        wind: windSelect.value as WindPreset,
         startIntervalS: Number(startIntervalSelect.value),
+        turnaroundPauseS: Math.max(0, Math.round(Number(turnaroundPauseInput.value) || 0)) * 60,
       });
       close();
     }

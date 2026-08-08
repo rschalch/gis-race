@@ -29,7 +29,23 @@ import type { Weather } from './types';
 // v5 adds R5's committed-pass model, whose per-step commitment draw is taken
 // unconditionally for every racing car — that alone reshuffles every car's rng
 // stream from the first step, on top of the changed passing behaviour itself.
-export const ENGINE_VERSION = 5;
+// v6 gates the R5 follow-gap clamp on actual speeds rather than the profile:
+// on tight road a follower whose desiredSpeed read at or below the leader's v
+// while still carrying more real speed used to skip the clamp entirely and
+// could close through BLOCK_MIN_GAP_M. No rng draw moved, so only seeds where
+// that situation arises replay differently.
+// v7 adds R15 engine heat-soak: the R13 reliability hazard now scales with a
+// smoothed engine-load state, so sustained flat-out running fails more often.
+// No rng draw moved, but the per-step failure threshold changes wherever
+// smoothed load exceeds ENGINE_LOAD_NEUTRAL, which any uncapped race does.
+// v8 lands the R15b-R19 batch, several of which alone would change every
+// seed: R18's driveline launch loss reshapes every acceleration below
+// 180 km/h (the largest effect — 0-100 times land on published figures);
+// R17 scales rolling resistance on loose surfaces; R15b derates power on a
+// heat-soaked engine; R19 fades brakes on sustained heavy braking; R16 adds
+// seed-directed wind (calm races are untouched by it, but not by the rest).
+// No rng draw moved.
+export const ENGINE_VERSION = 8;
 
 export const G = 9.81; // m/s²
 
@@ -378,3 +394,91 @@ export const RELIABILITY_LOAD_PER_S = 1.5e-5;
 // down over a few seconds, matching the spinning-state's "still visible"
 // principle.
 export const MECHANICAL_COAST_BRAKE = 0.3;
+
+// R15: engine heat-soak. R13's hazard reads *instantaneous* throttle, which
+// is memoryless — a machine held wide open for an hour was no more likely to
+// let go in the next second than one that just opened up, so a 380 km/h
+// hyperbike could sit at vMax for an entire uncapped course with only the
+// flat load term to answer for it. Each car now carries a smoothed load (an
+// exponential moving average of throttle, time constant ENGINE_LOAD_TAU_S),
+// and the hazard's load term scales up to (1 + ENGINE_STRESS_MULT) as that
+// average rises from ENGINE_LOAD_NEUTRAL toward 1. Below the neutral point
+// there is no penalty at all: limit-capped cruising and corner-brake-corner
+// rhythm both keep the average well under it, so shipped default races are
+// essentially untouched — this is a tax on *sustained* full load, not on
+// using the engine. Holding top speed IS sustained full load (top speed is
+// by definition the full-power point), which is exactly the case it exists
+// to price.
+export const ENGINE_LOAD_TAU_S = 45; // EMA time constant — stress builds over ~1-2 min flat out, cools on the same scale after lifting
+export const ENGINE_LOAD_NEUTRAL = 0.7; // no extra hazard at or below this smoothed load; hard road driving averages under it
+export const ENGINE_STRESS_MULT = 3; // load-term multiplier at full soak (4x R13): ~25% DNF over a 90 min flat-out run vs ~8% before
+// R15b: heat also derates power, so sustained flat-out is self-limiting
+// rather than only a reliability roll. 6% at full soak ≈ a hot intake and a
+// protective ECU pulling timing; via the drag equilibrium (v ∝ P^⅓) it sags
+// a top-speed run by ~2% — an H2R holding 380 km/h drifts back to ~372 —
+// without making any car undriveable. Applies at the same stress fraction
+// the hazard uses, so the two effects always agree on how cooked the engine
+// is. Fresh engines (engineLoad ≤ neutral) are entirely unaffected, which
+// keeps the roster-data top-speed reachability audit meaningful as-is.
+export const ENGINE_HEAT_POWER_FADE = 0.06;
+
+// R17: rough surface raises rolling resistance, not just lowering grip. A
+// point's `surface` value is authored as a grip multiplier (1 asphalt, ~0.8
+// gravel), and until now that was its only physical effect — but loose
+// surfaces also roughly double crr for a road tyre. Expressed off the same
+// per-point value so the baker needs no new field: crr is scaled by
+// 1 + THIS × (1 − surface), i.e. a surface that costs 20% grip costs 2x
+// rolling resistance. Runtime-only (the speed profile is grip/brake-bound
+// and never reads crr), so no profile cache-key change.
+export const SURFACE_CRR_PER_GRIP_LOSS = 5;
+
+// R18: driveline/launch loss. R14's constant-torque region assumed every
+// watt reaches the wheels from step-off, so modelled 0-100 km/h ran ~1.25 s
+// optimistic roster-wide and 5-7 s optimistic on economy cars (the guide's
+// own audit) — real cars lose launch force to clutch slip, shift
+// interruptions and per-gear torque dips, and the weaker the car the larger
+// the slice of its 0-100 run those eat. The power term is derated by up to
+// DRIVELINE_LOSS_MAX at standstill, tapering linearly to zero by
+// DRIVELINE_LOSS_FADE_SPEED — or by DRIVELINE_LOSS_VMAX_FRACTION x vMax for
+// machines slower than that, because near top speed the box is in top gear
+// and not shifting. Top-speed equilibrium is therefore untouched (the
+// roster reachability audit stays meaningful), traction- and pitch-limited
+// launches (supercars, superbikes — the machines the audit found accurate)
+// are untouched because their force cap binds below the power term, and the
+// power-limited middle drops onto published figures: sweep against eight
+// published 0-100 times took the mean model error from -2.08 s to -0.17 s
+// (Uno 10.2 -> 14.7 vs 16.5 published, Camry 5.3 -> 8.0 vs 7.8, GR86
+// 4.3 -> 6.5 vs 6.3, 911 Turbo S 2.7 -> 3.0 vs 2.7, Fireblade unchanged).
+export const DRIVELINE_LOSS_MAX = 0.5;
+export const DRIVELINE_LOSS_FADE_SPEED = 50; // m/s (180 km/h) — shift losses are per-gear events; above this they are noise
+export const DRIVELINE_LOSS_VMAX_FRACTION = 0.9; // taper end for machines whose vMax is below the fade speed
+
+// R19: brake fade. Sustained heavy braking (a mountain descent) heats pads
+// and fluid and costs stopping power; a lap of ordinary corner-brake-corner
+// rhythm does not. Each car carries `brakeHeat`, an EMA (BRAKE_HEAT_TAU_S)
+// of brake command × speed fraction (energy into the brakes scales with
+// both; town-speed braking barely warms them, BRAKE_HEAT_SPEED_REF). Above
+// BRAKE_HEAT_NEUTRAL, usable braking derates linearly to BRAKE_FADE_MAX at
+// full heat — in both the runtime controller's aCap AND physics' brake
+// force, so the driver knows exactly what the faded system can give and
+// brakes earlier to compensate (R1's lookahead does that automatically once
+// aCap drops). The profile keeps planning with fresh brakes (§0.2 — it
+// cannot rebuild mid-race), which stays SAFE because the plan only ever
+// demands BRAKE_SAFETY_MARGIN (0.6) of the fresh system: BRAKE_FADE_MAX
+// must therefore stay strictly below 1 − BRAKE_SAFETY_MARGIN = 0.4, or a
+// fully faded car could physically fail to make a planned braking ramp.
+export const BRAKE_HEAT_TAU_S = 20; // brakes heat and cool over tens of seconds, much faster than engine soak
+export const BRAKE_HEAT_SPEED_REF = 40; // m/s — full heat credit only for braking from motorway speed and above
+export const BRAKE_HEAT_NEUTRAL = 0.25; // normal racing rhythm (~15-20% braking duty) sits under this; a held descent exceeds it
+export const BRAKE_FADE_MAX = 0.3; // stopping power lost at full heat; MUST stay < 1 - BRAKE_SAFETY_MARGIN (see above)
+
+// R16: wind. One wind vector per race — a strength preset chosen in race
+// config, a compass direction drawn deterministically from the race seed —
+// projected onto the road's bearing at the car's s and subtracted from the
+// car's speed before the drag term (physics.ts windAlong). Headwind raises
+// effective airspeed, tailwind lowers it, and a route that doubles back
+// (the round-trip courses) gets the asymmetry for free. Speeds are Beaufort
+// anchors: 4 m/s is a gentle breeze you'd barely note in a car; 9 m/s is a
+// fresh breeze — at 250 km/h it swings drag by ±25%, which is why "windy"
+// visibly reshapes uncapped racing while leaving town-speed sections alone.
+export const WIND_PRESET_SPEED: Record<import('./types').WindPreset, number> = { calm: 0, breezy: 4, windy: 9 };

@@ -102,7 +102,7 @@ async function backfillFile(filePath: string, dryRun: boolean): Promise<'skipped
   // and the primary result would not be the road they were baked from.
   let candidates: GeometryCandidate[];
   try {
-    candidates = await fetchRouteGeometries([first.lon, first.lat], [last.lon, last.lat], true);
+    candidates = await fetchRouteGeometries([[first.lon, first.lat], [last.lon, last.lat]], true);
   } catch (err) {
     console.log(`  ${name}: geometry fetch failed (${(err as Error).message}), skipping`);
     return 'failed';

@@ -32,7 +32,7 @@ import { initRoutesPanel } from './render/routes-panel';
 import { initSummary } from './render/summary';
 import { createRouteStore } from './render/route-store';
 import { createSim, tick, resolveLeader, raceRank, type CarAssignment, type Sim } from './sim';
-import type { CarState, Incident, Route, Weather } from './types';
+import type { CarState, Incident, Route, Weather, WindPreset } from './types';
 import { loadCars } from './cars';
 import { MAX_FIELD_SIZE, buildFairField, tierOf } from './roster';
 import { START_INTERVAL_S, CAUTION_AHEAD_M, CAUTION_BEHIND_M } from './tuning';
@@ -86,14 +86,16 @@ function createStandbySim(
   assignments: CarAssignment[],
   globalCapEnabled: boolean,
   weather: Weather,
+  wind: WindPreset,
   startIntervalS: number,
+  turnaroundPauseS: number,
   timeScale: number,
   onIncident: Sim['onIncident'],
   // Explicit seed replays a specific race (the summary's "Replay this seed");
   // omitted means a fresh random one, which is what every new race wants.
   seed: number = randomSeed(),
 ): Sim {
-  const sim = createSim(assignments, seed, globalCapEnabled, weather, startIntervalS);
+  const sim = createSim(assignments, seed, globalCapEnabled, weather, startIntervalS, turnaroundPauseS, wind);
   sim.paused = true;
   sim.timeScale = timeScale;
   sim.onIncident = onIncident;
@@ -113,8 +115,12 @@ interface AppState {
   routesBySlug: Map<string, Route>;
   globalCapEnabled: boolean;
   weather: Weather;
+  /** R16: race-level wind preset (direction derives from the race seed). */
+  wind: WindPreset;
   /** Seconds between cars leaving the line; 0 is a mass start. */
   startIntervalS: number;
+  /** Seconds held at a there-and-back course's turnaround. */
+  turnaroundPauseS: number;
   sim: Sim;
   camera: CameraState;
 }
@@ -217,7 +223,9 @@ async function bootstrap() {
           routesBySlug: state.routesBySlug,
           globalCapEnabled: state.globalCapEnabled,
           weather: state.weather,
+          wind: state.wind,
           startIntervalS: state.startIntervalS,
+          turnaroundPauseS: state.turnaroundPauseS,
           timeScale: state.sim.timeScale,
         });
         fitToRoutes(map, [...state.routesBySlug.values()]);
@@ -265,7 +273,9 @@ async function bootstrap() {
           routesBySlug: state.routesBySlug,
           globalCapEnabled: state.globalCapEnabled,
           weather: state.weather,
+          wind: state.wind,
           startIntervalS: state.startIntervalS,
+          turnaroundPauseS: state.turnaroundPauseS,
           timeScale: state.sim.timeScale,
           seed,
         });
@@ -311,7 +321,9 @@ async function bootstrap() {
       routesBySlug: Map<string, Route>;
       globalCapEnabled: boolean;
       weather: Weather;
+      wind: WindPreset;
       startIntervalS: number;
+      turnaroundPauseS: number;
       timeScale: number;
       seed?: number;
     }): AppState {
@@ -331,12 +343,16 @@ async function bootstrap() {
         routesBySlug: overrides.routesBySlug,
         globalCapEnabled: overrides.globalCapEnabled,
         weather: overrides.weather,
+        wind: overrides.wind,
         startIntervalS: overrides.startIntervalS,
+        turnaroundPauseS: overrides.turnaroundPauseS,
         sim: createStandbySim(
           assignments,
           overrides.globalCapEnabled,
           overrides.weather,
+          overrides.wind,
           overrides.startIntervalS,
+          overrides.turnaroundPauseS,
           overrides.timeScale,
           handleIncident,
           overrides.seed,
@@ -353,7 +369,9 @@ async function bootstrap() {
       routesBySlug: initialRoutesBySlug,
       globalCapEnabled: true, // §7.1's default — matches the spec's own stand-in for legal limits
       weather: 'dry', // R7's default — matches the spec's own baseline condition
+      wind: 'calm', // R16's default — wind is an opt-in condition like weather
       startIntervalS: START_INTERVAL_S,
+      turnaroundPauseS: 0,
       timeScale: 1,
     });
     let lastTime: number | null = null;
@@ -415,6 +433,7 @@ async function bootstrap() {
       state.globalCapEnabled,
       state.weather,
       state.startIntervalS,
+      state.turnaroundPauseS,
       {
         onApply: (result) => {
           applyConfig(result).catch((err: unknown) => {
@@ -441,7 +460,9 @@ async function bootstrap() {
         routesBySlug,
         globalCapEnabled: result.globalCapEnabled,
         weather: result.weather,
+        wind: result.wind,
         startIntervalS: result.startIntervalS,
+        turnaroundPauseS: result.turnaroundPauseS,
         timeScale: state.sim.timeScale,
       });
       setRouteData(map, state.routesBySlug);
@@ -477,9 +498,18 @@ async function bootstrap() {
         state.sim.cars.length,
         state.camera.mode,
         state.camera.target,
+        // Pausing freezes simTime — the very thing that would otherwise
+        // change the key — but the race-controls buttons (Stop/Resume, the
+        // speed highlight) still have to re-render for these two.
+        state.sim.paused ? 1 : 0,
+        state.sim.timeScale,
         // The terrain toggle moves every car vertically; a window resize
         // changes the profile canvas geometry. Both can happen while paused.
         map.getTerrain() ? 1 : 0,
+        // Zoom drives the model/circle handover (MODEL_MIN_ZOOM /
+        // CIRCLE_FADE_OUT_ZOOM): zooming across it while paused must still
+        // reach updateCarPositions, or every car disappears until resume.
+        map.getZoom(),
         window.innerWidth,
         window.innerHeight,
       ].join('|');

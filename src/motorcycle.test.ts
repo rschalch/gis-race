@@ -117,6 +117,10 @@ describe('M1: incident severity', () => {
       rng: () => 0, // any above-threshold incident actually fires
       seed: 1,
       tireWear: 0,
+      engineLoad: 0,
+      brakeHeat: 0,
+    pauseRemaining: 0,
+    turnaroundTaken: false,
       condition: { grip: 1, cdA: 1 },
     };
   }

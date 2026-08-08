@@ -88,23 +88,83 @@ describe('computeAcceleration', () => {
     expect(aPeaky).toBeCloseTo(aTorquey, 10);
   });
 
-  it('R14: default peakPowerSpeed (5) reproduces the pre-R14 hardcoded-floor formula exactly, across speeds', () => {
-    // Full pre-R14 formula (fTraction = throttle * min(P/max(v,5),
-    // muLong*normalLoad), drag/roll otherwise unchanged), reproduced
+  it('R14+R18: default peakPowerSpeed (5) reproduces the documented force law exactly, across speeds', () => {
+    // The full traction formula (R14 constant-torque floor + R18's
+    // speed-tapered driveline loss on the power term), reproduced
     // independently here — not by calling computeAcceleration — as the
     // regression fixture the guide asked for.
     const spec = { ...TEST_CAR, peakPowerSpeed: 5 };
     const G = 9.81;
     const RHO_SEA_LEVEL = 1.225; // matches physics.ts's constant at ele=0 (default)
+    const fadeEnd = Math.min(50, 0.9 * spec.vMax); // DRIVELINE_LOSS_FADE_SPEED / _VMAX_FRACTION
     for (const v of [0, 2, 4.9, 5, 5.1, 8, 20, 40, 76]) {
       const grade = 0;
       const normalLoad = spec.mass * G * Math.cos(grade);
-      const oldFTraction = Math.min(spec.power / Math.max(v, 5), spec.muLong * normalLoad);
+      const drivelineEff = 1 - 0.5 * Math.max(0, 1 - v / fadeEnd); // DRIVELINE_LOSS_MAX
+      const fTraction = Math.min((drivelineEff * spec.power) / Math.max(v, 5), spec.muLong * normalLoad);
       const fDrag = 0.5 * RHO_SEA_LEVEL * spec.cdA * v * v;
       const fRoll = spec.crr * normalLoad;
-      const oldA = (oldFTraction - fDrag - fRoll) / spec.mass;
+      const wantA = (fTraction - fDrag - fRoll) / spec.mass;
       const { a } = computeAcceleration({ spec, v, grade, throttle: 1, brake: 0 });
-      expect(a).toBeCloseTo(oldA, 8);
+      expect(a).toBeCloseTo(wantA, 8);
     }
+  });
+});
+
+describe('R17: surface rolling resistance', () => {
+  it('a loose surface adds rolling drag on top of its grip cost', () => {
+    // Coasting (no traction/brake in play), so the only difference is fRoll.
+    const asphalt = computeAcceleration({ spec: TEST_CAR, v: 30, grade: 0, throttle: 0, brake: 0, surface: 1 });
+    const gravel = computeAcceleration({ spec: TEST_CAR, v: 30, grade: 0, throttle: 0, brake: 0, surface: 0.8 });
+    expect(gravel.a).toBeLessThan(asphalt.a);
+    // surface 0.8 → crr scaled by 1 + 5·0.2 = 2: the added deceleration is
+    // exactly one extra crr·G.
+    expect(asphalt.a - gravel.a).toBeCloseTo(TEST_CAR.crr * 9.81, 6);
+  });
+
+  it('default surface (asphalt) changes nothing', () => {
+    const implicit = computeAcceleration({ spec: TEST_CAR, v: 30, grade: 0, throttle: 1, brake: 0 });
+    const explicit = computeAcceleration({ spec: TEST_CAR, v: 30, grade: 0, throttle: 1, brake: 0, surface: 1 });
+    expect(implicit.a).toBe(explicit.a);
+  });
+});
+
+describe('R15b: engine heat power derate', () => {
+  // v = 40 is power-limited for TEST_CAR (traction cap far above P/v there),
+  // so any change in `a` is the power derate and nothing else.
+  it('a heat-soaked engine pulls less than a fresh one, by the tuned fraction', () => {
+    const fresh = computeAcceleration({ spec: TEST_CAR, v: 40, grade: 0, throttle: 1, brake: 0, engineLoad: 0 });
+    const atNeutral = computeAcceleration({ spec: TEST_CAR, v: 40, grade: 0, throttle: 1, brake: 0, engineLoad: 0.7 });
+    const soaked = computeAcceleration({ spec: TEST_CAR, v: 40, grade: 0, throttle: 1, brake: 0, engineLoad: 1 });
+    expect(atNeutral.a).toBe(fresh.a); // no penalty at or below the neutral point
+    expect(soaked.a).toBeLessThan(fresh.a);
+    // Traction force dropped by exactly the fade fraction of the (R18
+    // driveline-derated) power term.
+    const drivelineEff = 1 - 0.5 * Math.max(0, 1 - 40 / Math.min(50, 0.9 * TEST_CAR.vMax));
+    expect(fresh.aTire - soaked.aTire).toBeCloseTo((0.06 * drivelineEff * TEST_CAR.power) / 40 / TEST_CAR.mass, 8);
+  });
+});
+
+describe('R16: wind', () => {
+  it('headwind adds drag, tailwind sheds it, traction is untouched', () => {
+    const calm = computeAcceleration({ spec: TEST_CAR, v: 50, grade: 0, throttle: 1, brake: 0 });
+    const head = computeAcceleration({ spec: TEST_CAR, v: 50, grade: 0, throttle: 1, brake: 0, windAlong: -9 });
+    const tail = computeAcceleration({ spec: TEST_CAR, v: 50, grade: 0, throttle: 1, brake: 0, windAlong: 9 });
+    expect(head.a).toBeLessThan(calm.a);
+    expect(tail.a).toBeGreaterThan(calm.a);
+    // Wind lives purely in the drag term — the tyre-force channel (§7.5's
+    // friction circle input) must not see it.
+    expect(head.aTire).toBe(calm.aTire);
+    expect(tail.aTire).toBe(calm.aTire);
+  });
+});
+
+describe('R19: brake fade', () => {
+  it('hot brakes deliver proportionally less force for the same pedal', () => {
+    const cold = computeAcceleration({ spec: TEST_CAR, v: 40, grade: 0, throttle: 0, brake: 1, brakeFade: 1 });
+    const faded = computeAcceleration({ spec: TEST_CAR, v: 40, grade: 0, throttle: 0, brake: 1, brakeFade: 0.7 });
+    expect(faded.a).toBeGreaterThan(cold.a); // less deceleration
+    // aTire here is pure brake force, so the ratio is exactly the fade factor.
+    expect(faded.aTire / cold.aTire).toBeCloseTo(0.7, 8);
   });
 });

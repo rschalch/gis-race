@@ -52,6 +52,8 @@ function formatStatus(car: CarState, simTime: number): string {
   switch (car.status) {
     case 'staged':
       return `Starts in ${Math.max(0, car.startDelay - simTime).toFixed(0)}s`;
+    case 'paused':
+      return `At turnaround (${car.pauseRemaining.toFixed(0)}s)`;
     case 'spinning':
       return `Spinning (${car.recoveryRemaining.toFixed(0)}s)`;
     case 'retired':
@@ -199,6 +201,16 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
         <span class="telemetry-bar"><i data-bar="tire"></i></span>
         <span class="telemetry-value" data-value="tire"></span>
       </div>
+      <div class="telemetry-row">
+        <span class="telemetry-label">Engine</span>
+        <span class="telemetry-bar"><i data-bar="engine"></i></span>
+        <span class="telemetry-value" data-value="engine"></span>
+      </div>
+      <div class="telemetry-row">
+        <span class="telemetry-label">Brakes</span>
+        <span class="telemetry-bar"><i data-bar="brakeheat"></i></span>
+        <span class="telemetry-value" data-value="brakeheat"></span>
+      </div>
       <div class="telemetry-row telemetry-condition">
         <span class="telemetry-label">Condition</span>
         <span class="telemetry-value" data-value="condition"></span>
@@ -281,8 +293,11 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
     const leader = cars.length > 0 ? resolveLeader(cars, simTime) : null;
     const leaderRemaining = leader ? remainingDistance(leader) : 0;
     const leaderId = leader?.spec.id ?? null;
+    // TV mode follows a specific car exactly like follow mode does (main.ts
+    // resolves the same target), so both get the highlight and telemetry.
+    const followsACar = camera.mode === 'follow' || camera.mode === 'tv';
     const isSelected = (carId: string) =>
-      camera.mode === 'follow' && (camera.target === carId || (camera.target === 'leader' && carId === leaderId));
+      followsACar && (camera.target === carId || (camera.target === 'leader' && carId === leaderId));
 
     sorted.forEach((car, i) => {
       const row = d.rows.get(car.spec.id)!;
@@ -359,7 +374,7 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
 
     // Telemetry for whoever the camera is on; hidden entirely in overview or
     // free mode, where "the selected car" is not a thing.
-    const focus = camera.mode === 'follow' ? sorted.find((c) => isSelected(c.spec.id)) : undefined;
+    const focus = followsACar ? sorted.find((c) => isSelected(c.spec.id)) : undefined;
     d.telemetry.hidden = focus === undefined;
     if (focus) {
       setText(d.telemetryCar, focus.spec.name);
@@ -372,6 +387,11 @@ export function initHud(container: HTMLElement, callbacks: HudCallbacks): HudIns
       setBar('throttle', focus.throttle, `${Math.round(focus.throttle * 100)}%`);
       setBar('brake', focus.brake, `${Math.round(focus.brake * 100)}%`);
       setBar('tire', focus.tireWear, `${Math.round(focus.tireWear * 100)}% worn`);
+      // R15: smoothed engine load — the reliability hazard's stress signal,
+      // shown so a sustained flat-out run visibly cooks the motor.
+      setBar('engine', focus.engineLoad, `${Math.round(focus.engineLoad * 100)}% load`);
+      // R19: brake heat — a held mountain descent visibly cooks the brakes.
+      setBar('brakeheat', focus.brakeHeat, `${Math.round(focus.brakeHeat * 100)}% hot`);
       // R12 damage is permanent and small by design, so it reads better as an
       // explicit "none" than as a bar pinned near full.
       const gripLoss = Math.round((1 - focus.condition.grip) * 1000) / 10;

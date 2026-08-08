@@ -4,7 +4,7 @@
 // incident target band without a browser. Run via `npm run sim-batch --
 // --route sorocaba-campos --seeds 30`.
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { availableParallelism } from 'node:os';
 import { Worker, isMainThread, workerData, parentPort } from 'node:worker_threads';
@@ -13,11 +13,17 @@ import { buildCarSpecs } from '../src/cars';
 import { MAX_FIELD_SIZE, PERFORMANCE_TIERS, buildFairField, tierOf } from '../src/roster';
 import { createSim, tick, type CarAssignment } from '../src/sim';
 import { G, WEATHER_GRIP, START_INTERVAL_S } from '../src/tuning';
-import type { CarSpec, Route, Weather } from '../src/types';
+import type { CarSpec, Route, Weather, WindPreset } from '../src/types';
 
-const ROUTES_DIR = path.resolve('public/data/routes');
+// Both route homes, same precedence as the app: committed routes ship in
+// public/data/routes/, while the in-app Routes panel bakes into data/routes/
+// (outside publicDir — see dev-routes-api.ts, which stitches the two into one
+// namespace). Round trips carrying turnaroundS are typically panel-baked, so
+// --turnaroundPause is only exercisable if this tool reads both.
+const ROUTES_DIRS = [path.resolve('public/data/routes'), path.resolve('data/routes')];
 const CARS_PATH = path.resolve('public/data/cars.json');
 const WEATHERS: readonly Weather[] = ['dry', 'damp', 'wet'];
+const WINDS: readonly WindPreset[] = ['calm', 'breezy', 'windy'];
 
 interface CliArgs {
   route: string;
@@ -28,6 +34,11 @@ interface CliArgs {
   startIntervalS: number;
   /** Which slice of the ~200-car roster to race — see resolveField. */
   cars: string;
+  /** Minutes held at a there-and-back course's turnaround; ignored on
+   * one-way routes. */
+  turnaroundPauseS: number;
+  /** R16: race-level wind preset; direction derives from each seed. */
+  wind: WindPreset;
 }
 
 /** What the main thread hands each worker. The route is passed by *slug*, not
@@ -40,6 +51,8 @@ interface WorkerInput {
   weather: Weather;
   startIntervalS: number;
   cars: string;
+  turnaroundPauseS: number;
+  wind: WindPreset;
 }
 
 /** Results are tagged with their seed so the main thread can restore seed
@@ -66,6 +79,10 @@ function parseArgs(argv: string[]): CliArgs {
   if (!WEATHERS.includes(weather as Weather)) {
     throw new Error(`--weather must be one of ${WEATHERS.join('/')}, got "${weather}"`);
   }
+  const wind = values.wind ?? 'calm';
+  if (!WINDS.includes(wind as WindPreset)) {
+    throw new Error(`--wind must be one of ${WINDS.join('/')}, got "${wind}"`);
+  }
   const seeds = values.seeds ? Number(values.seeds) : 30;
   // Leave a core for the OS and the main thread. Never more workers than
   // seeds — an idle worker still pays full route-parse startup.
@@ -81,6 +98,8 @@ function parseArgs(argv: string[]): CliArgs {
     // the race format players actually get, not a mass start nothing uses.
     startIntervalS: values.startInterval !== undefined ? Number(values.startInterval) : START_INTERVAL_S,
     cars: values.cars ?? 'grid',
+    turnaroundPauseS: values.turnaroundPause !== undefined ? Number(values.turnaroundPause) * 60 : 0,
+    wind: wind as WindPreset,
   };
 }
 
@@ -117,9 +136,14 @@ function resolveField(specs: CarSpec[], cars: string): CarSpec[] {
 
 // Node-only route load (not src/route.ts's loadRoute — that fetches).
 function loadRouteSync(slug: string): Route {
-  const raw: unknown = JSON.parse(readFileSync(path.join(ROUTES_DIR, `${slug}.json`), 'utf-8'));
-  assertRoute(raw, slug);
-  return raw;
+  for (const dir of ROUTES_DIRS) {
+    const file = path.join(dir, `${slug}.json`);
+    if (!existsSync(file)) continue;
+    const raw: unknown = JSON.parse(readFileSync(file, 'utf-8'));
+    assertRoute(raw, slug);
+    return raw;
+  }
+  throw new Error(`Route "${slug}" not found in ${ROUTES_DIRS.map((d) => path.relative('.', d)).join(' or ')}`);
 }
 
 function loadCarsSync(): CarSpec[] {
@@ -155,9 +179,11 @@ function runRace(
   globalCapEnabled: boolean,
   weather: Weather,
   startIntervalS: number,
+  turnaroundPauseS: number,
+  wind: WindPreset,
 ): RaceResult {
   const assignments: CarAssignment[] = specs.map((spec) => ({ spec, route }));
-  const sim = createSim(assignments, seed, globalCapEnabled, weather, startIntervalS);
+  const sim = createSim(assignments, seed, globalCapEnabled, weather, startIntervalS, turnaroundPauseS, wind);
 
   const peakU = new Map<string, number>(specs.map((s) => [s.id, 0]));
   let nanOrInfinite = false;
@@ -229,7 +255,16 @@ function runSeeds(input: WorkerInput): SeededResult[] {
   const specs = resolveField(loadCarsSync(), input.cars);
   return input.seeds.map((seed) => ({
     seed,
-    result: runRace(route, specs, seed, input.globalCap, input.weather, input.startIntervalS),
+    result: runRace(
+      route,
+      specs,
+      seed,
+      input.globalCap,
+      input.weather,
+      input.startIntervalS,
+      input.turnaroundPauseS,
+      input.wind,
+    ),
   }));
 }
 
@@ -264,7 +299,7 @@ async function main(): Promise<void> {
   console.log(
     `sim-batch: route=${args.route} (${(route.totalDistance / 1000).toFixed(1)} km), ` +
       `cars=${specs.length} (--cars ${args.cars}), seeds=${args.seeds}, globalCap=${args.globalCap}, weather=${args.weather}, ` +
-      `jobs=${args.jobs}, startInterval=${args.startIntervalS}s`,
+      `jobs=${args.jobs}, startInterval=${args.startIntervalS}s, turnaroundPause=${args.turnaroundPauseS}s, wind=${args.wind}`,
   );
 
   const startedAt = Date.now();
@@ -275,6 +310,8 @@ async function main(): Promise<void> {
     weather: args.weather,
     startIntervalS: args.startIntervalS,
     cars: args.cars,
+    turnaroundPauseS: args.turnaroundPauseS,
+    wind: args.wind,
   };
   const seeded =
     args.jobs === 1
@@ -335,9 +372,27 @@ async function main(): Promise<void> {
   );
   console.log(`NaN/Infinity detected in any CarState: ${anyNaN}`);
   console.log(`Overtakes: ${totalOvertakes} (${(totalOvertakes / args.seeds).toFixed(2)} per race)`);
+  // Crash counts by third only mean something against how much crashable road
+  // each third holds. On the shipped Serra routes the twisty section IS the
+  // final third (581 tight points vs 22/12 on sorocaba-monte verde), so a raw
+  // late-third majority is geometry, not the R11 adaptation failing — verified
+  // by per-incident diagnosis: late crashes sit at the same U ≈ 1.0 transients
+  // as early ones, at a LOWER rate per tight corner. Wear adaptation failing
+  // looks like the per-exposure ratio climbing, not the raw count.
+  const TIGHT_CORNER_RADIUS_M = 120; // the radius band where this field's transient crashes actually happen
+  const exposure: [number, number, number] = [0, 0, 0];
+  for (const p of route.points) {
+    if (radiusAt(route, p.s) < TIGHT_CORNER_RADIUS_M) {
+      const third = Math.min(2, Math.floor((p.s / route.totalDistance) * 3));
+      exposure[third] = exposure[third]! + 1;
+    }
+  }
+  const perExposure = totalCrashByThird.map((n, i) => (exposure[i]! > 0 ? (n / exposure[i]!).toFixed(2) : '—'));
   console.log(
     `Crash incidents by race-distance third: early=${totalCrashByThird[0]} mid=${totalCrashByThird[1]} late=${totalCrashByThird[2]} ` +
-      `(R11's adaptation check — late should stay in the same ballpark as early/mid, not spike; ` +
+      `over tight-corner exposure ${exposure[0]}/${exposure[1]}/${exposure[2]} points (<${TIGHT_CORNER_RADIUS_M} m radius) ` +
+      `→ per-exposure ${perExposure[0]}/${perExposure[1]}/${perExposure[2]} ` +
+      `(R11's adaptation check — the per-exposure rate should not CLIMB toward the late thirds; ` +
       `mechanical DNFs excluded — they're throttle-driven, not utilisation-driven, and would confound this)`,
   );
   console.log(

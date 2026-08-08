@@ -45,6 +45,20 @@ export interface Route {
    * case the renderer falls back to `points` and looks exactly as it did.
    */
   shape?: Array<[number, number]>;
+
+  /**
+   * Distance along the route, in metres, at which a there-and-back course
+   * reverses — absent on every one-way route (§0.5).
+   *
+   * Recorded by the baker because only it knows where the two legs were
+   * joined: by the time the geometry is a flat list of points, the reversal is
+   * indistinguishable from a hairpin. The simulation uses it for one thing —
+   * holding each car here for `Sim.turnaroundPauseS` — and the *cornering* of
+   * the turn is not expressed through this at all; that is baked into the
+   * curvature like any other corner (see TURNAROUND_RADIUS_M in
+   * tools/bakeRoute.ts).
+   */
+  turnaroundS?: number;
 }
 
 /** §5.9: one entry in public/data/routes/index.json. Shared between the
@@ -141,12 +155,18 @@ export interface CarSpec {
   pitchLimitG: number;
 }
 
-/** `staged` = released into the race but not yet under way, i.e. waiting out
+/** `paused` = stopped at a there-and-back course's turnaround, waiting out
+ * `Sim.turnaroundPauseS` before setting off back. Its own status rather than a
+ * `spinning` car with a long recovery: a spin is an *incident* — it feeds the
+ * incident log, registers a caution hazard and damages the car — and none of
+ * that is true of a scheduled stop.
+ *
+ * `staged` = released into the race but not yet under way, i.e. waiting out
  * its interval-start delay at the line. Deliberately its own status rather
  * than a `racing` car that happens to sit at v=0: every cross-car rule
  * (drafting, blocking, hazards) must ignore a car that is not on the road
  * yet, and those rules are all expressed as status sets. */
-export type CarStatus = 'staged' | 'racing' | 'spinning' | 'retired' | 'finished';
+export type CarStatus = 'staged' | 'racing' | 'paused' | 'spinning' | 'retired' | 'finished';
 
 /** R7: one race-level condition, fixed for the whole race — dynamic weather
  * (changing mid-race) is a later feature; the event-log architecture
@@ -185,12 +205,32 @@ export interface CarState {
    * PASS_LINE_PENALTY) — which the ordinary friction-circle check then
    * punishes if the pass was committed somewhere stupid. 0 = not passing. */
   passRemaining: number;
+  /** Seconds left of the scheduled stop at the turnaround; 0 when not stopped.
+   * Separate from `recoveryRemaining` so a car cannot be counted as recovering
+   * from an incident it never had. */
+  pauseRemaining: number;
+  /** True once this car has taken the turnaround stop, so it is taken exactly
+   * once even though `s` sits past the mark for the whole return leg. */
+  turnaroundTaken: boolean;
   tireWear: number;            // R11: 0 (fresh) to 1 (fully worn), accumulates with distance/load
+  /** R15: exponential moving average of throttle (time constant
+   * ENGINE_LOAD_TAU_S) — the "how long has this engine been held open"
+   * signal the R13 reliability hazard reads. 0 at the start line. */
+  engineLoad: number;
+  /** R19: exponential moving average of brake command × speed fraction
+   * (time constant BRAKE_HEAT_TAU_S) — sustained heavy braking heats the
+   * system and costs stopping power (brakeFadeFactor). 0 at the start line. */
+  brakeHeat: number;
   condition: {                  // R11/R12: shared "effective condition" multipliers, both start at 1.
     grip: number;                // R12: permanently reduced a little by each slide/spin, floored at 0.9
     cdA: number;                  // R12: permanently increased a little by each spin (bodywork damage)
   };
 }
+
+/** R16: race-level wind strength. Direction is derived deterministically
+ * from the race seed (sim.ts windDirectionRad), so a preset plus a seed
+ * fully reproduces the race. */
+export type WindPreset = 'calm' | 'breezy' | 'windy';
 
 export interface Incident {
   s: number;            // where it happened
@@ -242,4 +282,15 @@ export interface StartEvent {
   carId: string;
 }
 
-export type RaceEvent = IncidentEvent | OvertakeEvent | FinishEvent | StartEvent;
+/** A car reaching a there-and-back course's turnaround and beginning its
+ * scheduled stop. Logged rather than inferred: the stop is a real chunk of
+ * every finishing time, and a race log that shows a car apparently parked for
+ * four minutes with no explanation is worse than no log. */
+export interface TurnaroundEvent {
+  time: number;
+  type: 'turnaround';
+  carId: string;
+  data: { pauseS: number };
+}
+
+export type RaceEvent = IncidentEvent | OvertakeEvent | FinishEvent | StartEvent | TurnaroundEvent;

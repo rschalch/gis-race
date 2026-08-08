@@ -8,6 +8,7 @@
 import { writeFile, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Route, RoutePoint, RouteIndexEntry } from '../src/types.ts';
+import { parseEndpointText, formatLatLon, MAX_VIA_STOPS } from '../src/coords';
 
 export const SPACING = 25; // metres — §5.3
 export const MAX_DISTANCE_KM = 1000; // practical cap for an interactive, user-is-waiting bake
@@ -83,6 +84,30 @@ export async function searchPlaces(query: string): Promise<Array<{ label: string
   return results.map((r) => ({ label: r.display_name, lon: parseFloat(r.lon), lat: parseFloat(r.lat) }));
 }
 
+/**
+ * Nominatim reverse lookup, used only to *name* an endpoint given as
+ * coordinates. Never to place one: the coordinates are the truth, and this is
+ * cosmetic — so a failure falls back to the formatted pair rather than
+ * aborting a bake that is otherwise perfectly well specified.
+ */
+async function reverseGeocode(lon: number, lat: number): Promise<string | null> {
+  try {
+    const url = `${NOMINATIM_URL}/reverse?format=json&lon=${lon}&lat=${lat}&zoom=14`;
+    const res = await nominatimFetch(url);
+    if (!res.ok) return null;
+    const result = (await res.json()) as { display_name?: string; address?: Record<string, string> };
+    const address = result.address ?? {};
+    // The full display_name is a postal address ("R. Ten. ..., Sorocaba, São
+    // Paulo, Região Sudeste, 18000-000, Brasil") — far too long for a course
+    // name. Prefer the settlement.
+    const place =
+      address.city ?? address.town ?? address.village ?? address.municipality ?? address.county ?? address.state;
+    return place ?? result.display_name?.split(',')[0]?.trim() ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function geocode(query: string): Promise<[number, number]> {
   const url = `${NOMINATIM_URL}/search?format=json&q=${encodeURIComponent(query)}&limit=1`;
   const res = await nominatimFetch(url);
@@ -132,17 +157,17 @@ export function decodePolyline6(encoded: string): [number, number][] {
 // primary. Unlike OSRM's demo server it returns them readily where a
 // competing road exists; like OSRM, asking is still not a guarantee.
 async function fetchValhallaGeometries(
-  from: [number, number],
-  to: [number, number],
+  locations: [number, number][],
   alternatives: boolean,
 ): Promise<GeometryCandidate[]> {
   const request = {
-    locations: [
-      { lon: from[0], lat: from[1] },
-      { lon: to[0], lat: to[1] },
-    ],
+    locations: locations.map(([lon, lat]) => ({ lon, lat })),
     costing: 'auto',
-    alternates: alternatives ? MAX_ALTERNATIVES - 1 : 0,
+    // Alternatives are a two-point idea: with intermediate stops the path is
+    // already pinned, and Valhalla rejects the combination rather than
+    // ignoring it. Suppressed rather than refused — the route is still bakeable
+    // and the caller is told (see fetchRouteGeometries).
+    alternates: alternatives && locations.length === 2 ? MAX_ALTERNATIVES - 1 : 0,
     directions_type: 'none', // skip turn-by-turn maneuvers — only the shape is used
     units: 'kilometers',
   };
@@ -160,8 +185,9 @@ async function fetchValhallaGeometries(
     );
   }
 
-  // Two locations → one leg per trip; flatMap tolerates a multi-leg response
-  // anyway. summary.length is km (units requested explicitly above).
+  // One leg per consecutive pair of locations, so a route through stops
+  // arrives as several — flatMap stitches them back into one polyline.
+  // summary.length is km (units requested explicitly above).
   const trips = [body.trip, ...(body.alternates ?? []).map((a) => a.trip)].slice(0, MAX_ALTERNATIVES);
   return trips.map((trip) => ({
     coords: trip.legs.flatMap((leg) => decodePolyline6(leg.shape)),
@@ -170,14 +196,13 @@ async function fetchValhallaGeometries(
 }
 
 async function fetchOsrmGeometries(
-  from: [number, number],
-  to: [number, number],
+  locations: [number, number][],
   alternatives: boolean,
 ): Promise<GeometryCandidate[]> {
   const osrmUrl =
     `https://router.project-osrm.org/route/v1/driving/` +
-    `${from[0]},${from[1]};${to[0]},${to[1]}` +
-    `?overview=full&geometries=geojson${alternatives ? '&alternatives=true' : ''}`;
+    locations.map(([lon, lat]) => `${lon},${lat}`).join(';') +
+    `?overview=full&geometries=geojson${alternatives && locations.length === 2 ? '&alternatives=true' : ''}`;
   console.log(`Fetching route${alternatives ? 's' : ''} from OSRM: ${osrmUrl}`);
   const res = await fetch(osrmUrl);
   if (!res.ok) {
@@ -187,7 +212,7 @@ async function fetchOsrmGeometries(
   if (body.code !== 'Ok' || body.routes.length === 0) {
     throw new BakeError(
       body.code === 'NoRoute'
-        ? "No drivable route found between those two places — they may not be connected by road."
+        ? 'No drivable route found through those places — check the order, and that each one is on a road.'
         : `OSRM returned no route (code=${body.code})`,
     );
   }
@@ -202,18 +227,21 @@ async function fetchOsrmGeometries(
 // posture as the Overpass pass (degrade, don't fail the bake), except a
 // routing failure on BOTH engines is fatal (there's nothing to bake).
 export async function fetchRouteGeometries(
-  from: [number, number],
-  to: [number, number],
+  locations: [number, number][],
   alternatives: boolean,
 ): Promise<GeometryCandidate[]> {
+  if (locations.length < 2) throw new BakeError('A route needs at least a start and a finish.');
+  if (alternatives && locations.length > 2) {
+    console.log('  (alternatives skipped: a route through intermediate stops has only one shape)');
+  }
   let candidates: GeometryCandidate[];
   let source = 'Valhalla';
   try {
-    candidates = await fetchValhallaGeometries(from, to, alternatives);
+    candidates = await fetchValhallaGeometries(locations, alternatives);
   } catch (err) {
     console.warn(`  WARNING: Valhalla failed (${String(err)}) — falling back to OSRM.`);
     source = 'OSRM';
-    candidates = await fetchOsrmGeometries(from, to, alternatives);
+    candidates = await fetchOsrmGeometries(locations, alternatives);
   }
 
   const valid = candidates.filter((c) => {
@@ -477,6 +505,86 @@ export function computeRadius(pts: Array<{ x: number; y: number }>, half: number
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
+}
+
+/**
+ * Cornering radius written over the point where a there-and-back course
+ * reverses, in metres.
+ *
+ * This has to be imposed rather than measured, because the measurement is
+ * confidently wrong. Menger curvature reads three points 50 m apart, and where
+ * a route doubles back along the same road the outer two land on top of each
+ * other: the triangle has no area, the formula returns Infinity, and the
+ * tightest manoeuvre on the whole course is recorded as a 5 km-radius
+ * straight. Cars would take the reversal at the speed limit.
+ *
+ * 15 m is the floor computeRadius already clamps to — the tightest thing this
+ * model represents, and about what a road-width U-turn actually is. It plans
+ * out at roughly 45 km/h through the turn, which is generous for a three-point
+ * turn and about right for a roundabout or a junction loop, which is what a
+ * router usually returns here anyway.
+ */
+const TURNAROUND_RADIUS_M = 15;
+
+/** How far either side of the reversal that radius applies. A U-turn occupies
+ * a couple of car lengths; this is deliberately wider than the 25 m sampling
+ * grid so the constraint cannot fall between two samples. */
+const TURNAROUND_WINDOW_M = 40;
+
+/** Stamps a U-turn onto the curvature profile. Applied to the *raw* radius,
+ * before the forward-looking min filter, so the approach inherits it and cars
+ * brake for the turn instead of arriving at it. */
+function applyTurnaroundRadius(radius: number[], pts: Array<{ s: number }>, turnaroundS: number): void {
+  for (let i = 0; i < pts.length; i++) {
+    if (Math.abs(pts[i]!.s - turnaroundS) <= TURNAROUND_WINDOW_M) {
+      radius[i] = Math.min(radius[i]!, TURNAROUND_RADIUS_M);
+    }
+  }
+}
+
+/**
+ * How sharply the path has to double back to count as a reversal, as the
+ * cosine of the angle between the incoming and outgoing directions. -0.8 is
+ * about 143°: sharper than any junction turn, and comfortably reached by a
+ * genuine about-face.
+ */
+const REVERSAL_COS_THRESHOLD = -0.8;
+
+/** Samples either side used to measure that angle — 2 × 25 m, the same span
+ * the Menger curvature uses, so the two agree about what a "turn" is. */
+const REVERSAL_WINDOW_SAMPLES = 2;
+
+/**
+ * Finds every point where the route doubles back on itself.
+ *
+ * Menger curvature cannot see these: it reads three points 50 m apart, and on
+ * an exact about-face the outer two land on top of each other, giving a
+ * zero-area triangle and therefore infinite radius — the tightest manoeuvre on
+ * the course recorded as a straight. Round trips hit it at their join, but so
+ * does any route with an intermediate stop that requires turning round (a
+ * dead-end village, a spur off a main road, a stop on the far carriageway), so
+ * this is measured from the geometry rather than assumed at one known index.
+ *
+ * Exported for testing: the failure mode is silent and the fix is invisible in
+ * the output, so it is worth pinning directly.
+ */
+export function detectReversals(pts: Array<{ x: number; y: number }>, window = REVERSAL_WINDOW_SAMPLES): number[] {
+  const found: number[] = [];
+  for (let i = window; i < pts.length - window; i++) {
+    const before = pts[i - window]!;
+    const here = pts[i]!;
+    const after = pts[i + window]!;
+    const inX = here.x - before.x;
+    const inY = here.y - before.y;
+    const outX = after.x - here.x;
+    const outY = after.y - here.y;
+    const inLen = Math.hypot(inX, inY);
+    const outLen = Math.hypot(outX, outY);
+    if (inLen < 1e-6 || outLen < 1e-6) continue;
+    const cos = (inX * outX + inY * outY) / (inLen * outLen);
+    if (cos <= REVERSAL_COS_THRESHOLD) found.push(i);
+  }
+  return found;
 }
 
 // --- R8/R10: road surface + speed limit tags from Overpass ---
@@ -828,9 +936,30 @@ export interface BakeVariantResult {
 
 export interface BakeResult {
   variants: BakeVariantResult[];
+  /** Every stop between start and finish, resolved, in order. */
+  via: ResolvedEndpoint[];
+  /** How each endpoint was actually resolved — the caller needs the labels to
+   * name the course, and with a coordinate endpoint there is no input text
+   * worth showing. */
+  from: ResolvedEndpoint;
+  to: ResolvedEndpoint;
+}
+
+export interface ResolvedEndpoint {
+  coord: [number, number];
+  /** Human-readable, for the route index: the place name as typed, the
+   * settlement a coordinate reverse-geocodes to, or the coordinates
+   * themselves if the lookup came back empty. */
+  label: string;
+  /** True when the caller gave coordinates rather than a place to look up. */
+  exact: boolean;
 }
 
 export interface BakeOptions {
+  /** A place name to geocode, or "lat, lon" coordinates — see
+   * src/coords.ts. Coordinates skip geocoding entirely, which is the only way
+   * to start a race at a specific point on a specific road rather than at
+   * whatever a town name resolves to. */
   from: string;
   to: string;
   /** Coordinates already known (e.g. the autocomplete suggestion the user
@@ -839,6 +968,29 @@ export interface BakeOptions {
    * `limit=1` re-geocoding of the display text happens to resolve to. */
   fromCoord?: [number, number];
   toCoord?: [number, number];
+  /**
+   * Ordered intermediate stops between `from` and `to`, each a place name or
+   * "lat, lon" like the endpoints.
+   *
+   * This is the lever that actually decides *which roads* a race uses. Exact
+   * endpoints pin where it starts and ends, but everything between them is the
+   * router's choice of fastest path; a stop partway forces it through a
+   * specific pass, bypass or coast road. The router visits them in the order
+   * given — they are waypoints, not a set.
+   */
+  via?: string[];
+  /** Coordinates already known for the corresponding `via` entry (an
+   * autocomplete pick), same precedence rule as fromCoord/toCoord. */
+  viaCoords?: Array<[number, number] | undefined>;
+  /**
+   * Bake there *and back*: start → finish → start, as one continuous route.
+   *
+   * The return leg is routed separately rather than mirrored, because it
+   * genuinely can differ — one-way systems, turn restrictions and time-of-day
+   * costs all mean B→A is not always A→B reversed, and mirroring would quietly
+   * invent a road that cannot be driven in that direction.
+   */
+  roundTrip?: boolean;
   /** F1: also request routing alternatives (Valhalla `alternates`, or OSRM
    * `alternatives=true` on fallback) and bake every usable one, sharing a
    * courseId — Waze-style routes cars can be individually assigned to.
@@ -854,6 +1006,8 @@ async function bakeGeometry(
   coords: [number, number][],
   distanceM: number,
   onElevationProgress?: (done: number, total: number) => void,
+  /** Index into `coords` where a round trip reverses, if it is one. */
+  turnaroundIndex?: number,
 ): Promise<BakeVariantResult> {
   const warnings: string[] = [];
 
@@ -937,6 +1091,28 @@ async function bakeGeometry(
 
   console.log('Computing curvature (Menger curvature, 50 m spacing, 75 m forward-looking min-filter)...');
   const rawRadius = computeRadius(resampled, 2);
+
+  // Any about-face, wherever it came from — a round trip's join, or a stop
+  // that can only be reached by turning round.
+  const reversals = detectReversals(resampled);
+  if (reversals.length > 0) {
+    const at = reversals.map((i) => (resampled[i]!.s / 1000).toFixed(1)).join(', ');
+    console.log(`  ${reversals.length} reversal(s) detected at ${at} km — forcing a ${TURNAROUND_RADIUS_M} m radius`);
+    for (const i of reversals) applyTurnaroundRadius(rawRadius, resampled, resampled[i]!.s);
+  }
+
+  let turnaroundS: number | undefined;
+  if (turnaroundIndex !== undefined) {
+    // Distance to the reversal measured along the projected polyline, not
+    // taken from the router's leg distance: the two disagree by a few metres
+    // and the window has to sit on the actual geometry.
+    turnaroundS = 0;
+    for (let i = 1; i <= turnaroundIndex && i < projected.length; i++) {
+      turnaroundS += Math.hypot(projected[i]!.x - projected[i - 1]!.x, projected[i]!.y - projected[i - 1]!.y);
+    }
+    console.log(`  round trip: forcing a ${TURNAROUND_RADIUS_M} m turnaround at ${(turnaroundS / 1000).toFixed(1)} km`);
+    applyTurnaroundRadius(rawRadius, resampled, turnaroundS);
+  }
   const radius = minFilter(rawRadius, 3);
 
   logRadiusHistogram(radius);
@@ -1014,6 +1190,7 @@ async function bakeGeometry(
     spacing: SPACING,
     points,
     shape,
+    ...(turnaroundS !== undefined ? { turnaroundS: round(turnaroundS, 2) } : {}),
   };
 
   return {
@@ -1024,20 +1201,191 @@ async function bakeGeometry(
   };
 }
 
-/** Geocodes, fetches one or more OSRM geometries (F1's `alternatives`), and
- * bakes each into its own variant — shared by the CLI and the dev-server API. */
-export async function bakeRoute({ from, to, fromCoord, toCoord, alternatives, onElevationProgress }: BakeOptions): Promise<BakeResult> {
-  if (!fromCoord || !toCoord) console.log(`Geocoding endpoints (rate-limited to 1 req/s)...`);
-  const resolvedFromCoord = fromCoord ?? (await geocode(from));
-  const resolvedToCoord = toCoord ?? (await geocode(to));
+interface RoundTripGeometry extends GeometryCandidate {
+  /** Index into `coords` of the reversal — see applyTurnaroundRadius. */
+  turnaroundIndex: number;
+}
 
-  const geometries = await fetchRouteGeometries(resolvedFromCoord, resolvedToCoord, alternatives ?? false);
+// Same-road verdict: OSM maps a two-way road as one shared centreline, so a
+// return leg down the outbound road sits at near-zero offset from it, while
+// even a parallel dual carriageway is tens of metres out.
+const SAME_ROAD_TOLERANCE_M = 30;
+const SAME_ROAD_SAMPLES = 25;
+
+/**
+ * Log-only verdict for buildRoundTrips: does the return leg run back down the
+ * outbound road? Judged geometrically — vertex counts say nothing (two
+ * different roads can tie, and the same road re-densified can differ). A
+ * spread of return-leg points is measured against the outbound polyline, and
+ * the median offset decides, so a shared first and last kilometre out of town
+ * doesn't tip the verdict either way.
+ */
+function sameRoadBack(out: [number, number][], back: [number, number][]): boolean {
+  const { project } = makeProjection(out[0]![0], out[0]![1]);
+  const outXY = out.map(([lon, lat]) => project(lon, lat));
+  const offsets: number[] = [];
+  for (let i = 0; i < SAME_ROAD_SAMPLES; i++) {
+    const idx = Math.round((i * (back.length - 1)) / Math.max(1, SAME_ROAD_SAMPLES - 1));
+    const [lon, lat] = back[idx]!;
+    const p = project(lon, lat);
+    let best = Infinity;
+    for (let j = 0; j < outXY.length - 1; j++) {
+      const a = outXY[j]!;
+      const b = outXY[j + 1]!;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len2 = dx * dx + dy * dy;
+      const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2));
+      best = Math.min(best, Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy)));
+    }
+    offsets.push(best);
+  }
+  offsets.sort((a, b) => a - b);
+  return offsets[Math.floor(offsets.length / 2)]! <= SAME_ROAD_TOLERANCE_M;
+}
+
+/**
+ * Joins each outbound variant to a return leg routed in the other direction.
+ *
+ * Variants are paired by index (outbound alternative 1 with return alternative
+ * 1, and so on) so a course's variants stay genuinely distinct *loops* rather
+ * than every one of them sharing a return road. Where the router offers fewer
+ * ways back than out, the extras reuse the primary return.
+ */
+async function buildRoundTrips(
+  outbound: GeometryCandidate[],
+  fromCoord: [number, number],
+  toCoord: [number, number],
+  alternatives: boolean,
+): Promise<RoundTripGeometry[]> {
+  // The way home is routed finish → start with no intermediate stops: the
+  // stops describe how to get *there*, and forcing the same ones in reverse
+  // would guarantee the return mirrors the outward leg, which is the one thing
+  // a separately-routed return exists to avoid. To pin the way back too, list
+  // the whole loop explicitly instead (…--via <finish> --via <return stop>
+  // --to <start>).
+  console.log('Round trip: routing the return leg separately...');
+  const inbound = await fetchRouteGeometries([toCoord, fromCoord], alternatives);
+
+  return outbound.map((out, i) => {
+    const back = inbound[i] ?? inbound[0]!;
+    // The join is one point in two geometries — drop the duplicate, or the
+    // resampler sees a zero-length segment at exactly the place the course is
+    // most sensitive.
+    const coords = [...out.coords, ...back.coords.slice(1)];
+    const distanceM = out.distanceM + back.distanceM;
+    if (distanceM / 1000 > MAX_DISTANCE_KM) {
+      throw new BakeError(
+        `That round trip is ${(distanceM / 1000).toFixed(0)} km — over the ${MAX_DISTANCE_KM} km cap. ` +
+          `Halve it, or bake the one-way route instead.`,
+      );
+    }
+    console.log(
+      `  variant ${i + 1}: ${(out.distanceM / 1000).toFixed(1)} km out + ${(back.distanceM / 1000).toFixed(1)} km back` +
+        `${sameRoadBack(out.coords, back.coords) ? ' (same road)' : ' (different road back)'}`,
+    );
+    return { coords, distanceM, turnaroundIndex: out.coords.length - 1 };
+  });
+}
+
+/**
+ * "A → B", "A → V → B", or "A → V → B → A" for a round trip.
+ *
+ * The stops are part of the name because they are the whole point of listing
+ * them: a course through Monte Verde is a different race from the one that
+ * takes the motorway, and the two would otherwise be indistinguishable in the
+ * picker. Long chains are elided in the middle rather than truncated, so both
+ * ends — the bit that identifies the course — always survive.
+ */
+export function describeCourse(from: string, via: string[], to: string, roundTrip: boolean): string {
+  const MAX_STOPS_SHOWN = 3;
+  // Shown: the first MAX_STOPS_SHOWN - 1 stops plus the last one. The "more"
+  // count is what's actually hidden between them — the always-shown last stop
+  // is not part of it.
+  const stops =
+    via.length > MAX_STOPS_SHOWN
+      ? [...via.slice(0, MAX_STOPS_SHOWN - 1), `…${via.length - MAX_STOPS_SHOWN} more…`, via[via.length - 1]!]
+      : via;
+  const legs = [from, ...stops, to];
+  if (roundTrip) legs.push(from);
+  return legs.join(' → ');
+}
+
+/**
+ * Turns one endpoint into a coordinate plus a label.
+ *
+ * Three ways in, in order of precedence: a coordinate the caller already knows
+ * (the autocomplete suggestion that was clicked), coordinates typed into the
+ * text itself, or a place name to geocode.
+ */
+export async function resolveEndpoint(text: string, known?: [number, number]): Promise<ResolvedEndpoint> {
+  if (known) return { coord: known, label: text, exact: true };
+
+  const parsed = parseEndpointText(text);
+  if (parsed.kind === 'invalid') throw new BakeError(parsed.reason);
+  if (parsed.kind === 'place') return { coord: await geocode(text), label: text, exact: false };
+
+  const { lat, lon } = parsed.value;
+  const name = await reverseGeocode(lon, lat);
+  console.log(`  using exact coordinates ${formatLatLon(parsed.value)}${name ? ` (near ${name})` : ''}`);
+  return { coord: [lon, lat], label: name ?? formatLatLon(parsed.value), exact: true };
+}
+
+/** Resolves endpoints, fetches one or more route geometries (F1's
+ * `alternatives`), and bakes each into its own variant — shared by the CLI and
+ * the dev-server API. */
+export async function bakeRoute({
+  from,
+  to,
+  fromCoord,
+  toCoord,
+  via,
+  viaCoords,
+  alternatives,
+  roundTrip,
+  onElevationProgress,
+}: BakeOptions): Promise<BakeResult> {
+  // Enforced here, not only in the panel UI: a bake holds the dev server's
+  // bake mutex for its whole rate-limited run, so an over-long stop chain from
+  // any caller (API, CLI) must be rejected before it starts fetching.
+  if ((via ?? []).length > MAX_VIA_STOPS) {
+    throw new BakeError(
+      `${via!.length} intermediate stops — the cap is ${MAX_VIA_STOPS}. ` +
+        `Elevation sampling is rate-limited, so longer chains take too long to bake.`,
+    );
+  }
+  const needsLookup = [
+    { text: from, coord: fromCoord },
+    { text: to, coord: toCoord },
+    ...(via ?? []).map((text, i) => ({ text, coord: viaCoords?.[i] })),
+  ].some(({ text, coord }) => !coord && parseEndpointText(text).kind === 'place');
+  if (needsLookup) console.log(`Geocoding endpoints (rate-limited to 1 req/s)...`);
+  const resolvedFrom = await resolveEndpoint(from, fromCoord);
+  // Sequentially, not in parallel: geocoding is rate-limited to 1 req/s and
+  // nominatimFetch serialises anyway, so Promise.all would only queue.
+  const resolvedVia: ResolvedEndpoint[] = [];
+  for (const [i, text] of (via ?? []).entries()) {
+    resolvedVia.push(await resolveEndpoint(text, viaCoords?.[i]));
+  }
+  const resolvedTo = await resolveEndpoint(to, toCoord);
+
+  const outward: [number, number][] = [resolvedFrom.coord, ...resolvedVia.map((v) => v.coord), resolvedTo.coord];
+  if (resolvedVia.length > 0) {
+    console.log(`Routing through ${resolvedVia.length} stop(s): ${resolvedVia.map((v) => v.label).join(' → ')}`);
+  }
+
+  const outbound = await fetchRouteGeometries(outward, alternatives ?? false);
+  const geometries = roundTrip
+    ? await buildRoundTrips(outbound, resolvedFrom.coord, resolvedTo.coord, alternatives ?? false)
+    : outbound.map((g) => ({ ...g, turnaroundIndex: undefined as number | undefined }));
 
   const variants: BakeVariantResult[] = [];
   for (let i = 0; i < geometries.length; i++) {
-    const { coords, distanceM } = geometries[i]!;
+    const { coords, distanceM, turnaroundIndex } = geometries[i]!;
     if (geometries.length > 1) console.log(`\n--- Baking variant ${i + 1}/${geometries.length} ---`);
-    variants.push(await bakeGeometry(coords, distanceM, (done, total) => onElevationProgress?.(i, done, total)));
+    variants.push(
+      await bakeGeometry(coords, distanceM, (done, total) => onElevationProgress?.(i, done, total), turnaroundIndex),
+    );
   }
-  return { variants };
+  return { variants, from: resolvedFrom, to: resolvedTo, via: resolvedVia };
 }

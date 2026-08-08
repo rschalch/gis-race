@@ -30,6 +30,8 @@ import {
   MOTORCYCLE_CORNER_UTILISATION_TARGET,
   MOTORCYCLE_SEVERITY_SHIFT,
   MOTORCYCLE_RECOVERY_MULT,
+  BRAKE_HEAT_NEUTRAL,
+  BRAKE_FADE_MAX,
 } from './tuning';
 
 /**
@@ -59,12 +61,23 @@ export function weatherGripFor(spec: CarSpec, weather: Weather): number {
  * trips the brake trigger for any aReqMax and flips brake = aReqMax/aCap
  * negative — which survives the final clamp and reaches physics as thrust.
  */
-function brakeCapability(spec: CarSpec, gripMultiplier: number, grade: number): number {
+function brakeCapability(spec: CarSpec, gripMultiplier: number, grade: number, brakeFade = 1): number {
   const tyreLimited = spec.muLong * gripMultiplier * G * Math.cos(grade);
+  // R19: fade scales the friction term only — gravity doesn't care how hot
+  // the pads are. The profile's backward pass calls this with fresh brakes
+  // (fade 1, §0.2); the runtime controller passes the car's current factor.
   return Math.max(
     0.5,
-    Math.min(tyreLimited, spec.pitchLimitG * G) * BRAKE_SAFETY_MARGIN + G * Math.sin(grade),
+    Math.min(tyreLimited, spec.pitchLimitG * G) * BRAKE_SAFETY_MARGIN * brakeFade + G * Math.sin(grade),
   );
+}
+
+/** R19: usable-braking multiplier for a given brake heat — 1 until
+ * BRAKE_HEAT_NEUTRAL, falling linearly to 1 − BRAKE_FADE_MAX at full heat.
+ * Shared by stepCar (physics + controller must agree on what the faded
+ * system delivers). */
+export function brakeFadeFactor(brakeHeat: number): number {
+  return 1 - BRAKE_FADE_MAX * (Math.max(0, brakeHeat - BRAKE_HEAT_NEUTRAL) / (1 - BRAKE_HEAT_NEUTRAL));
 }
 
 // Speed profiles are pure functions of (route, spec, globalCapEnabled) and
@@ -209,6 +222,7 @@ export function driverControl(
   weather: Weather,
   speedCap?: number,
   conditionGrip = 1,
+  brakeFade = 1, // R19: usable-braking multiplier from brakeFadeFactor(car.brakeHeat)
 ): DriverOutput {
   // R7/R8/R11/R12: weather × road-surface × condition grip, composed the
   // same way the profile build (weather/surface only — condition can't
@@ -268,7 +282,10 @@ export function driverControl(
   // vehicle can actually do. R7: gripMultiplier derates it the same way the
   // profile build does.
   const grade = route.points[idx]!.grade;
-  const aCap = brakeCapability(spec, gripMultiplier, grade);
+  // R19: faded brakes shrink aCap, which both trips the R1 brake trigger
+  // earlier (longer, earlier braking zones — how a real driver copes with
+  // fade) and scales the commanded fraction up so demand still gets met.
+  const aCap = brakeCapability(spec, gripMultiplier, grade, brakeFade);
 
   let raw: DriverOutput;
   if (aReqMax > BRAKE_TRIGGER_FRACTION * aCap) {

@@ -396,3 +396,114 @@ bikes sit inside that same band (Gold Wing −1.4 s, R6 −0.7 s), and superbike
 actually land closer to reality than the cars do (2.78–2.96 s modelled against
 2.9–3.1 s published). Left alone deliberately: distorting motorcycle data to
 compensate for a roster-wide property of R14 would hide it.
+
+**The two rosters had never been cross-checked against each other.** The bike
+grip bands above are physically audited; the car bands predate them and were
+authored conservatively — so every sport bike out-braked every car in the game
+(effective braking 1.08–1.15 g against a best car `muLong` of 0.98) and
+out-cornered every car including an Aventador SVJ (`muLat` 1.12 vs 1.04),
+inverting the intent stated in this section's table that a superbike "cannot
+out-brake a good car". Fixed on the car side, since the bike numbers survive
+their own audit: 95 modern performance-and-up cars re-rated to measured
+carbon-ceramic / track-rubber levels — track specials (Senna, SVJ, GT2 RS,
+Black Series…) `muLat`/`muLong` 1.08–1.15, modern supercars and hypercars
+`muLong` 1.05–1.08, modern performance cars `muLong` ≈ 1.0, performance SUVs
+0.95. Analog classics (F40, Countach, McLaren F1…) keep period grip on
+purpose, and bikes legitimately still out-accelerate everything out of slow
+corners — the pitch cap, not power, binds there. Data-only (each touched
+entry's `notes` records the old → new values); no engine change, so no
+ENGINE_VERSION bump.
+
+## R15 — Engine heat-soak (added after M1)
+
+R13's hazard reads *instantaneous* throttle, which is memoryless: a machine
+held wide open for an hour was no more likely to let go in the next second
+than one that had just opened up. With speed limits disabled that let a
+380 km/h hyperbike sit at vMax for an entire course with only the flat load
+term to answer for it — spotted by a user asking, reasonably, "wouldn't that
+crash the motor?"
+
+**Design.** Each car carries `engineLoad`, an exponential moving average of
+throttle (`ENGINE_LOAD_TAU_S` = 45 s), updated in `stepCar` just before the
+R13 draw reads it — pure state, no rng, so the §0.1 draw layout is
+untouched. `reliabilityHazardRate` scales its load term by up to
+`1 + ENGINE_STRESS_MULT` (4×) as the average rises from
+`ENGINE_LOAD_NEUTRAL` (0.7) toward 1. At or below neutral there is no
+penalty at all. Holding top speed *is* sustained full load — vMax is by
+definition the full-power point — which is exactly the case this prices.
+The HUD telemetry strip shows the smoothed load as an "Engine" bar.
+
+**Measured** (10–40 seeds each): the shipped capped format is untouched
+(mechanical DNFs 5.0% of car-races before and after — limit-bound cruising
+runs single-digit throttle). Uncapped on a twisty 100 km course, mechanical
+DNFs rose 4.5% → 6.5% of car-races: corners give the engine breathers, so
+the average sits only intermittently above neutral, which is the intended
+shape. The headline case — an H2R flat-out on a 150 km straight — settles at
+`engineLoad` ≈ 0.86 and now blows up in 12.5% of 25-minute runs (~2.4%
+before); held for a full 90-minute course that compounds to roughly a
+one-in-four mechanical DNF. ENGINE_VERSION 6 → 7 (the golden race's draws
+all miss the shifted thresholds, so its recorded constants survived).
+
+## R16–R19 — the v8 batch (added after R15)
+
+Four items landed together as ENGINE_VERSION 8, alongside one diagnosis that
+changed a *metric* rather than the engine.
+
+**The "late-race crash spike" was geometry, not a wear leak.** Uncapped
+batches on the Serra routes showed crashes clustering in the final third
+(e.g. 9/2/23), which read like R11's adaptation failing. Per-incident
+diagnosis showed otherwise: the final third of sorocaba–monte verde holds
+581 tight-corner (<120 m radius) points against 22/12 in the first two, and
+per unit of that exposure the late-race crash rate is actually the *lowest*
+of the three thirds (0.32/0.08/0.03 measured post-batch) — worn tyres cost
+pace, not risk, exactly as designed. sim-batch now prints the exposure-
+normalized ratio alongside the raw counts, and `sim.test.ts` pins the
+adaptation on a uniform-risk route (100 km of constant cornering: the car
+ends worn, measurably slower, and crash-free).
+
+**R16 — wind.** One wind vector per race: a strength preset in race config
+(calm/breezy/windy — 0/4/9 m/s, Beaufort anchors), a compass direction drawn
+deterministically from the race seed (`windDirectionRad`, a throwaway PRNG
+stream — not `car.rng`, which §0.1 forbids shifting). The road's per-point
+bearing (`pointBearingsRad` — a route *property* like grade, not car state;
+the sim stays 1D) is projected against it once at `createSim`, and physics
+subtracts the tailwind component from ground speed before the drag term
+(signed `vAir·|vAir|`). Measured on a 50 km straight: a windy tailwind saves
+~13 s, a windy headwind costs ~50 s (asymmetric because drag is quadratic
+and the top end is power-limited); on a twisty Serra course the components
+largely cancel — which is what wind really does there.
+
+**R15b — heat derates power.** The R15 stress fraction now also pulls up to
+6% of power (`ENGINE_HEAT_POWER_FADE`), so a flat-out top-speed run sags
+~2% rather than being purely a reliability roll. Same neutral point, so
+fresh engines and capped cruising are untouched.
+
+**R17 — surface rolling resistance.** A point's `surface` grip value now
+also scales `crr` (1 + 5×grip-lost — gravel that costs 20% grip doubles
+rolling resistance). Runtime-only; the grip-bound profile never reads crr.
+
+**R18 — driveline launch loss.** R14's constant-torque region assumed every
+watt reached the wheels from step-off; modelled 0–100 ran 1.25 s optimistic
+roster-wide and 5–7 s on economy cars. The power term is now derated up to
+50% at standstill, tapering to zero by 50 m/s (or 0.9·vMax if lower — top
+gear doesn't shift), leaving top-speed equilibrium and traction/pitch-
+limited launches untouched. Sweep against eight published 0–100 figures:
+mean model error −2.08 s → −0.17 s (Uno 10.2 → 14.7 vs 16.5 published,
+Camry 5.3 → 8.0 vs 7.8, GR86 4.3 → 6.5 vs 6.3, 911 Turbo S 2.7 → 3.0,
+Fireblade/H2R unchanged — pitch-limited, as the audit found them accurate).
+
+**R19 — brake fade.** `brakeHeat` (EMA of pedal × speed fraction, τ 20 s)
+derates usable braking to at most −30% at full heat, in the runtime
+controller's `aCap` and physics' brake force together — the driver brakes
+earlier to compensate (R1's lookahead does this for free once aCap drops).
+The profile still plans on fresh brakes (§0.2), which is safe because the
+plan only ever demands `BRAKE_SAFETY_MARGIN` (0.6) of the fresh system:
+`BRAKE_FADE_MAX` must stay strictly below 0.4, and the constant's comment
+says so. Normal corner rhythm sits under the heat neutral point; held
+mountain descents exceed it. HUD telemetry shows both new signals (Engine
+load, Brake heat).
+
+§0.4 on v8 (10 seeds, sorocaba–monte verde): capped crash rate
+0.010/car-race, mechanical 6.0%, no NaN; uncapped crash 0.120/car-race,
+off-road retirements 2.0% (at the ≤2% ceiling), per-exposure thirds
+declining. Golden re-recorded (launch loss + surface crr both touch it).

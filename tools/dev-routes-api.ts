@@ -5,7 +5,9 @@
 //
 // Endpoints:
 //   GET  /api/routes/search?q=...   autocomplete suggestions (Nominatim proxy)
-//   POST /api/routes/bake           { from, to, alternatives? } -> bakes,
+//   POST /api/routes/bake           { from, to, via?, alternatives?, roundTrip? } -> bakes,
+//                                    where from/to are place names or exact
+//                                    "lat, lon" coordinates (src/coords.ts),
 //                                    persists, returns the new
 //                                    RouteIndexEntry variant(s) (or an error)
 //   DELETE /api/routes/courses/<courseId>
@@ -40,7 +42,7 @@ import type { Plugin } from 'vite';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFile, writeFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
-import { bakeRoute, saveRoute, upsertRouteIndex, BakeError, searchPlaces } from './bakeRoute';
+import { bakeRoute, describeCourse, saveRoute, upsertRouteIndex, BakeError, searchPlaces } from './bakeRoute';
 import type { Route, RouteIndexEntry } from '../src/types.ts';
 
 const COMMITTED_ROUTES_DIR = path.resolve('public/data/routes');
@@ -247,7 +249,14 @@ export function routesApiPlugin(): Plugin {
               to?: string;
               fromCoord?: { lon: number; lat: number };
               toCoord?: { lon: number; lat: number };
+              /** Intermediate stops, in the order they are driven through.
+               * Each carries its own optional coordinate for the same reason
+               * the endpoints do: a clicked autocomplete suggestion already
+               * knows exactly where it is, so re-geocoding its label would be
+               * both slower and less precise. */
+              via?: Array<{ text?: string; coord?: { lon: number; lat: number } }>;
               alternatives?: boolean;
+              roundTrip?: boolean;
             };
             const from = body.from?.trim();
             const to = body.to?.trim();
@@ -261,10 +270,46 @@ export function routesApiPlugin(): Plugin {
             const toCoord: [number, number] | undefined = body.toCoord
               ? [body.toCoord.lon, body.toCoord.lat]
               : undefined;
+            // Blank stops are dropped rather than rejected: the panel keeps an
+            // empty field around for the next one to be typed into, and an
+            // empty box is a stop the user has not filled in yet, not an error.
+            const stops = (body.via ?? [])
+              .map((v) => ({ text: v.text?.trim() ?? '', coord: v.coord }))
+              .filter((v) => v.text.length > 0);
 
             const { entries, warnings } = await enqueueBake(async () => {
-              const { variants } = await bakeRoute({ from, to, fromCoord, toCoord, alternatives: body.alternatives });
-              const courseId = await uniqueSlug(`${slugify(from)}-${slugify(to)}`);
+              const {
+                variants,
+                from: resolvedFrom,
+                to: resolvedTo,
+                via: resolvedVia,
+              } = await bakeRoute({
+                from,
+                to,
+                fromCoord,
+                toCoord,
+                via: stops.map((v) => v.text),
+                viaCoords: stops.map((v) => (v.coord ? [v.coord.lon, v.coord.lat] : undefined)),
+                alternatives: body.alternatives,
+                roundTrip: body.roundTrip,
+              });
+              // Name and slug come from the *resolved* endpoints: a course
+              // started from typed coordinates would otherwise be called
+              // "-23.50150, -47.45260 → ..." and slugged to match.
+              const courseName = describeCourse(
+                resolvedFrom.label,
+                resolvedVia.map((v) => v.label),
+                resolvedTo.label,
+                body.roundTrip ?? false,
+              );
+              // The slug names the two ends and *counts* the stops rather than
+              // listing them: a chain of four labels makes a filename nobody
+              // can read, and the stops are already spelled out in the name.
+              const viaPart = resolvedVia.length > 0 ? `-via-${resolvedVia.length}` : '';
+              const courseId = await uniqueSlug(
+                `${slugify(resolvedFrom.label)}-${slugify(resolvedTo.label)}${viaPart}` +
+                  `${body.roundTrip ? '-round-trip' : ''}`,
+              );
 
               const entries: RouteIndexEntry[] = [];
               const warnings: string[] = [];
@@ -273,7 +318,7 @@ export function routesApiPlugin(): Plugin {
                 const slug = i === 0 ? courseId : `${courseId}-alt${i + 1}`;
                 const entry: RouteIndexEntry = {
                   slug,
-                  name: `${from} → ${to}`,
+                  name: courseName,
                   distanceKm: variant.distanceKm,
                   elevationGainM: variant.elevationGainM,
                   courseId,

@@ -806,6 +806,13 @@ const CIRCLE_UPDATE_INTERVAL_MS = 50;
 
 const circlesUpdatedAtByMap = new WeakMap<MapLibreMap, number>();
 
+// The id carried by the `selected` feature property in the last setData —
+// a selection change bypasses the interval throttle below. With the sim
+// paused, main.ts's render-key gate allows exactly ONE frame per selection
+// change; if that frame lands inside the throttle window the ring would
+// stay on the previous car until the sim is resumed.
+const circleSelectedIdByMap = new WeakMap<MapLibreMap, string | null>();
+
 /**
  * Maps the user is mid-pan on.
  *
@@ -864,9 +871,13 @@ export function updateCarPositions(map: MapLibreMap, cars: CarMarker[], now: num
   // empty up there, so waiting out the throttle would blink the cars away).
   if (panningByMap.has(map)) return;
   const refilling = circlesClearedByMap.get(map) === true;
+  const selectedId = cars.find((c) => c.selected)?.id ?? null;
+  const selectionChanged = circleSelectedIdByMap.get(map) !== selectedId;
   const lastUpdate = circlesUpdatedAtByMap.get(map);
-  if (!refilling && lastUpdate !== undefined && now - lastUpdate < CIRCLE_UPDATE_INTERVAL_MS) return;
+  if (!refilling && !selectionChanged && lastUpdate !== undefined && now - lastUpdate < CIRCLE_UPDATE_INTERVAL_MS)
+    return;
   circlesUpdatedAtByMap.set(map, now);
+  circleSelectedIdByMap.set(map, selectedId);
 
   const data: FeatureCollection<Point> = {
     type: 'FeatureCollection',
